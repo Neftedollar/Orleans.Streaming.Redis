@@ -2,3 +2,10 @@ bin/
 obj/
 .DS_Store
 *.user
+
+# Build artifacts
+nupkg/
+TestResults/
+
+# Claude Code memory
+.claude/

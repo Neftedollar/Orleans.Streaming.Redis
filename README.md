@@ -1,7 +1,13 @@
 # Orleans.Streaming.Redis
 
-[![NuGet](https://img.shields.io/nuget/v/Orleans.Streaming.Redis.svg)](https://www.nuget.org/packages/Orleans.Streaming.Redis)
+[![CI](https://github.com/Neftedollar/Orleans.Streaming.Redis/actions/workflows/ci.yml/badge.svg)](https://github.com/Neftedollar/Orleans.Streaming.Redis/actions/workflows/ci.yml)
+[![NuGet](https://img.shields.io/nuget/v/Orleans.Streaming.Redis.svg?logo=nuget)](https://www.nuget.org/packages/Orleans.Streaming.Redis)
+[![NuGet Downloads](https://img.shields.io/nuget/dt/Orleans.Streaming.Redis.svg?logo=nuget)](https://www.nuget.org/packages/Orleans.Streaming.Redis)
+[![codecov](https://codecov.io/gh/Neftedollar/Orleans.Streaming.Redis/branch/main/graph/badge.svg)](https://codecov.io/gh/Neftedollar/Orleans.Streaming.Redis)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![.NET](https://img.shields.io/badge/.NET-8.0%20%7C%209.0%20%7C%2010.0-512BD4?logo=dotnet)](https://dotnet.microsoft.com)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
+[![GitHub Stars](https://img.shields.io/github/stars/Neftedollar/Orleans.Streaming.Redis?style=social)](https://github.com/Neftedollar/Orleans.Streaming.Redis)
 
 **Redis Streams persistent stream provider for [Microsoft Orleans](https://learn.microsoft.com/dotnet/orleans/) 10.x**
 
@@ -134,8 +140,21 @@ Each silo runs a pulling agent per queue partition. Messages are distributed acr
 - **[Production Deployment](docs/production.md)** — Redis sizing, HA, monitoring, scaling, Docker Compose
 - **[Troubleshooting](docs/troubleshooting.md)** — common issues, Redis CLI debugging, logging
 
-Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
+## Contributing
+
+Contributions are welcome! Check out the [Contributing Guide](CONTRIBUTING.md) to get started.
+
+- Browse [`good first issue`](https://github.com/Neftedollar/Orleans.Streaming.Redis/labels/good%20first%20issue) for beginner-friendly tasks
+- Read the [Code of Conduct](CODE_OF_CONDUCT.md)
+- Review the [Security Policy](SECURITY.md) for reporting vulnerabilities
+
+## Community
+
+- [GitHub Discussions](https://github.com/Neftedollar/Orleans.Streaming.Redis/discussions) — questions, ideas, show & tell
+- [GitHub Issues](https://github.com/Neftedollar/Orleans.Streaming.Redis/issues) — bug reports and feature requests
+
+If this project is useful to you, please consider giving it a :star: — it helps others discover it!
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE) — free for commercial and open-source use.

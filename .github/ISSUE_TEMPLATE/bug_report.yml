@@ -1,0 +1,100 @@
+name: Bug Report
+description: Report a bug or unexpected behavior
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug! Please fill out the sections below.
+
+  - type: input
+    id: version
+    attributes:
+      label: Package Version
+      description: Which version of Orleans.Streaming.Redis are you using?
+      placeholder: "1.0.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: dotnet-version
+    attributes:
+      label: .NET Version
+      options:
+        - .NET 8
+        - .NET 9
+        - .NET 10
+    validations:
+      required: true
+
+  - type: input
+    id: orleans-version
+    attributes:
+      label: Orleans Version
+      placeholder: "10.0.1"
+    validations:
+      required: true
+
+  - type: input
+    id: redis-version
+    attributes:
+      label: Redis Version
+      placeholder: "7.2"
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: A clear description of the bug.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      description: Minimal steps to reproduce the behavior.
+      value: |
+        1. Configure provider with ...
+        2. Publish message ...
+        3. See error ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Behavior
+      description: What actually happened? Include error messages, stack traces, or logs.
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Configuration
+      description: Your RedisStreamOptions configuration (redact connection strings).
+      render: csharp
+
+  - type: dropdown
+    id: environment
+    attributes:
+      label: Environment
+      options:
+        - Local development
+        - Docker / Kubernetes
+        - Cloud (Azure, AWS, GCP)
+        - CI/CD
+        - Other
+    validations:
+      required: false

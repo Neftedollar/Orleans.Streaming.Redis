@@ -81,15 +81,32 @@ public class RedisStreamAdapterFactory : IQueueAdapterFactory, IAsyncDisposable
     }
 
     /// <summary>
-    /// Fix #8: dispose the ConnectionMultiplexer on shutdown.
+    /// Disposes the ConnectionMultiplexer on shutdown.
+    /// NOTE: CloseAsync + Dispose is the recommended SE.Redis teardown sequence.
+    /// We swallow ObjectDisposedException here because Orleans may dispose this factory
+    /// after the host has already stopped (e.g. in WebApplicationFactory teardown in tests),
+    /// at which point SE.Redis internals may already be gone. Logging the warning is enough.
     /// </summary>
     public async ValueTask DisposeAsync()
     {
-        if (_redis is not null)
+        var redis = Interlocked.Exchange(ref _redis, null);
+        if (redis is null)
+            return;
+
+        try
         {
-            await _redis.CloseAsync();
-            _redis.Dispose();
-            _redis = null;
+            await redis.CloseAsync();
+        }
+        catch (ObjectDisposedException) { /* already closed, nothing to do */ }
+        catch (Exception ex)
+        {
+            _loggerFactory?.CreateLogger<RedisStreamAdapterFactory>()
+                .LogWarning(ex, "RedisStreamAdapterFactory: CloseAsync failed during dispose.");
+        }
+        finally
+        {
+            try { redis.Dispose(); }
+            catch (ObjectDisposedException) { /* already disposed */ }
         }
     }
 

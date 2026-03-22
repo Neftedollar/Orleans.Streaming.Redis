@@ -40,7 +40,36 @@ jobs:
         run: dotnet build --no-restore --configuration Release
 
       - name: Test
-        run: dotnet test --no-build --configuration Release --verbosity normal
+        run: >-
+          dotnet test --no-build --configuration Release
+          --verbosity normal
+          --logger "trx;LogFileName=test-results.trx"
+          --collect:"XPlat Code Coverage"
+          --results-directory ./TestResults
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results
+          path: ./TestResults
+
+      - name: Generate coverage report
+        if: success()
+        run: |
+          dotnet tool install -g dotnet-reportgenerator-globaltool
+          reportgenerator \
+            -reports:./TestResults/**/coverage.cobertura.xml \
+            -targetdir:./TestResults/CoverageReport \
+            -reporttypes:Cobertura
+
+      - name: Upload coverage to Codecov
+        if: success()
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./TestResults/**/coverage.cobertura.xml
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
 
   publish:
     runs-on: ubuntu-latest
