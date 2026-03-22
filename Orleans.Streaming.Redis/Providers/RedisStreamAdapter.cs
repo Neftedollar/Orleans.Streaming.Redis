@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Logging;
 using Orleans.Serialization;
 using Orleans.Streaming.Redis.Configuration;
 using Orleans.Streams;
@@ -16,19 +17,22 @@ public class RedisStreamAdapter : IQueueAdapter
     private readonly IConnectionMultiplexer _redis;
     private readonly Serializer _serializer;
     private readonly RedisStreamQueueMapper _queueMapper;
+    private readonly ILoggerFactory? _loggerFactory;
 
     public RedisStreamAdapter(
         string providerName,
         RedisStreamOptions options,
         IConnectionMultiplexer redis,
         Serializer serializer,
-        RedisStreamQueueMapper queueMapper)
+        RedisStreamQueueMapper queueMapper,
+        ILoggerFactory? loggerFactory = null)
     {
         Name = providerName;
         _options = options;
         _redis = redis;
         _serializer = serializer;
         _queueMapper = queueMapper;
+        _loggerFactory = loggerFactory;
     }
 
     public string Name { get; }
@@ -45,7 +49,8 @@ public class RedisStreamAdapter : IQueueAdapter
             _options.ConsumerGroup,
             _options.MaxBatchSize,
             db,
-            _serializer);
+            _serializer,
+            _loggerFactory?.CreateLogger<RedisStreamReceiver>());
     }
 
     public async Task QueueMessageBatchAsync<T>(
@@ -58,7 +63,6 @@ public class RedisStreamAdapter : IQueueAdapter
         var streamKey = RedisStreamQueueMapper.GetRedisKey(_options.KeyPrefix, queueId);
         var db = _redis.GetDatabase(_options.Database);
 
-        // Serialize the batch: streamId + events + requestContext
         var payload = SerializeBatch(streamId, events, requestContext);
 
         var maxLen = _options.MaxStreamLength > 0 ? _options.MaxStreamLength : (int?)null;

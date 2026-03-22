@@ -7,6 +7,7 @@ namespace Orleans.Streaming.Redis.Providers;
 /// <summary>
 /// Wraps events from a single Redis Stream entry into an Orleans IBatchContainer.
 /// Each entry maps to one batch container with a sequence token derived from the Redis entry ID.
+/// Carries the Redis entry ID for XACK on delivery confirmation.
 /// </summary>
 [GenerateSerializer]
 public class RedisBatchContainer : IBatchContainer
@@ -15,6 +16,13 @@ public class RedisBatchContainer : IBatchContainer
     [Id(1)] private readonly List<object> _events;
     [Id(2)] private readonly Dictionary<string, object>? _requestContext;
     [Id(3)] private readonly EventSequenceTokenV2 _sequenceToken;
+
+    /// <summary>
+    /// Redis Stream entry ID (e.g., "1679000000000-0"). Used by
+    /// <see cref="RedisStreamReceiver.MessagesDeliveredAsync"/> to XACK.
+    /// Not serialized via Orleans — only lives within the silo process.
+    /// </summary>
+    [Id(4)] public string? RedisEntryId { get; init; }
 
     public RedisBatchContainer(
         StreamId streamId,

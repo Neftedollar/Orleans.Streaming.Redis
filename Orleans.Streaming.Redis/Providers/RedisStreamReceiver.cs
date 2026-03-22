@@ -1,5 +1,5 @@
+using Microsoft.Extensions.Logging;
 using Orleans.Providers.Streams.Common;
-using Orleans.Runtime;
 using Orleans.Serialization;
 using Orleans.Streams;
 using StackExchange.Redis;
@@ -9,6 +9,7 @@ namespace Orleans.Streaming.Redis.Providers;
 /// <summary>
 /// Receives messages from a single Redis Stream queue partition.
 /// Uses XREADGROUP with consumer groups for reliable delivery.
+/// Acknowledges delivered messages via XACK.
 /// </summary>
 public class RedisStreamReceiver : IQueueAdapterReceiver
 {
@@ -17,6 +18,7 @@ public class RedisStreamReceiver : IQueueAdapterReceiver
     private readonly int _maxBatchSize;
     private readonly IDatabase _db;
     private readonly Serializer _serializer;
+    private readonly ILogger? _logger;
     private string _consumerId = string.Empty;
 
     public RedisStreamReceiver(
@@ -24,15 +26,18 @@ public class RedisStreamReceiver : IQueueAdapterReceiver
         string consumerGroup,
         int maxBatchSize,
         IDatabase db,
-        Serializer serializer)
+        Serializer serializer,
+        ILogger? logger = null)
     {
         _streamKey = streamKey;
         _consumerGroup = consumerGroup;
         _maxBatchSize = maxBatchSize;
         _db = db;
         _serializer = serializer;
+        _logger = logger;
     }
 
+    /// <inheritdoc />
     public async Task Initialize(TimeSpan timeout)
     {
         _consumerId = $"silo-{Guid.NewGuid():N}";
@@ -48,18 +53,32 @@ public class RedisStreamReceiver : IQueueAdapterReceiver
         {
             // Group already exists — expected in multi-silo setup.
         }
+
+        _logger?.LogInformation(
+            "RedisStreamReceiver initialized: stream={StreamKey}, group={Group}, consumer={Consumer}",
+            _streamKey, _consumerGroup, _consumerId);
     }
 
+    /// <inheritdoc />
     public async Task<IList<IBatchContainer>> GetQueueMessagesAsync(int maxCount)
     {
         var count = Math.Min(maxCount, _maxBatchSize);
         var result = new List<IBatchContainer>();
 
         // Read new messages (">") for this consumer in the group.
-        var entries = await _db.StreamReadGroupAsync(
-            _streamKey, _consumerGroup, _consumerId,
-            position: ">",
-            count: count);
+        StreamEntry[] entries;
+        try
+        {
+            entries = await _db.StreamReadGroupAsync(
+                _streamKey, _consumerGroup, _consumerId,
+                position: ">",
+                count: count);
+        }
+        catch (RedisException ex)
+        {
+            _logger?.LogWarning(ex, "RedisStreamReceiver: failed to read from {StreamKey}", _streamKey);
+            return result;
+        }
 
         if (entries is null || entries.Length == 0)
             return result;
@@ -84,32 +103,70 @@ public class RedisStreamReceiver : IQueueAdapterReceiver
                     streamId,
                     payload.Events,
                     payload.RequestContext,
-                    token);
+                    token)
+                {
+                    // Carry the Redis entry ID so MessagesDeliveredAsync can XACK it.
+                    RedisEntryId = entry.Id.ToString()
+                };
 
                 result.Add(container);
             }
-            catch
+            catch (Exception ex)
             {
-                // Skip malformed entries — log in production.
+                _logger?.LogWarning(ex,
+                    "RedisStreamReceiver: failed to deserialize entry {EntryId} from {StreamKey}",
+                    entry.Id, _streamKey);
             }
         }
 
         return result;
     }
 
+    /// <inheritdoc />
     public async Task MessagesDeliveredAsync(IList<IBatchContainer> messages)
     {
-        // ACK delivered messages so they won't be re-delivered to this consumer.
-        // In Redis Streams, XACK marks messages as processed for the consumer group.
-        // We don't XDEL — let MAXLEN on XADD handle retention.
-        // NOTE: we don't have the Redis entry IDs here (IBatchContainer doesn't carry them).
-        // For v0.1, we rely on the consumer group auto-advance + MAXLEN for cleanup.
-        // A proper implementation would store entry IDs in the batch container.
-        await Task.CompletedTask;
+        if (messages is null || messages.Count == 0)
+            return;
+
+        // Collect Redis entry IDs from delivered batch containers.
+        var entryIds = new List<RedisValue>();
+        foreach (var msg in messages)
+        {
+            if (msg is RedisBatchContainer rbc && rbc.RedisEntryId is not null)
+                entryIds.Add(rbc.RedisEntryId);
+        }
+
+        if (entryIds.Count == 0)
+            return;
+
+        try
+        {
+            // XACK: acknowledge messages as processed for this consumer group.
+            // After XACK, messages won't appear in XPENDING and won't be re-delivered.
+            var acked = await _db.StreamAcknowledgeAsync(
+                _streamKey, _consumerGroup, [.. entryIds]);
+
+            _logger?.LogDebug(
+                "RedisStreamReceiver: XACK {Count}/{Total} entries on {StreamKey}",
+                acked, entryIds.Count, _streamKey);
+        }
+        catch (RedisException ex)
+        {
+            // Non-fatal: unacked messages will be re-delivered on next XREADGROUP
+            // with "0" position (pending entries). This is the Redis Streams
+            // at-least-once delivery guarantee.
+            _logger?.LogWarning(ex,
+                "RedisStreamReceiver: XACK failed for {Count} entries on {StreamKey}",
+                entryIds.Count, _streamKey);
+        }
     }
 
+    /// <inheritdoc />
     public Task Shutdown(TimeSpan timeout)
     {
+        _logger?.LogInformation(
+            "RedisStreamReceiver shutting down: stream={StreamKey}, consumer={Consumer}",
+            _streamKey, _consumerId);
         return Task.CompletedTask;
     }
 }

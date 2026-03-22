@@ -1,4 +1,5 @@
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Orleans.Serialization;
 using Orleans.Streaming.Redis.Configuration;
 using Orleans.Streams;
@@ -15,17 +16,20 @@ public class RedisStreamAdapterFactory : IQueueAdapterFactory
     private readonly string _providerName;
     private readonly RedisStreamOptions _options;
     private readonly Serializer _serializer;
+    private readonly ILoggerFactory? _loggerFactory;
     private readonly RedisStreamQueueMapper _queueMapper;
     private IConnectionMultiplexer? _redis;
 
     public RedisStreamAdapterFactory(
         string providerName,
         RedisStreamOptions options,
-        Serializer serializer)
+        Serializer serializer,
+        ILoggerFactory? loggerFactory = null)
     {
         _providerName = providerName;
         _options = options;
         _serializer = serializer;
+        _loggerFactory = loggerFactory;
         _queueMapper = new RedisStreamQueueMapper(options.QueueCount, providerName);
     }
 
@@ -38,7 +42,8 @@ public class RedisStreamAdapterFactory : IQueueAdapterFactory
             _options,
             _redis,
             _serializer,
-            _queueMapper);
+            _queueMapper,
+            _loggerFactory);
     }
 
     public IQueueAdapterCache GetQueueAdapterCache()
@@ -57,12 +62,13 @@ public class RedisStreamAdapterFactory : IQueueAdapterFactory
     {
         var options = services.GetOptionsByName<RedisStreamOptions>(providerName);
         var serializer = services.GetRequiredService<Serializer>();
-        return new RedisStreamAdapterFactory(providerName, options, serializer);
+        var loggerFactory = services.GetService<ILoggerFactory>();
+        return new RedisStreamAdapterFactory(providerName, options, serializer, loggerFactory);
     }
 }
 
 /// <summary>
-/// Minimal queue adapter cache using Orleans built-in SimpleQueueCache.
+/// Minimal queue adapter cache wrapping <see cref="RedisQueueCache"/>.
 /// </summary>
 internal class SimpleQueueAdapterCache : IQueueAdapterCache
 {
