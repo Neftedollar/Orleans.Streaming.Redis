@@ -47,6 +47,10 @@ jobs:
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
 
+    permissions:
+      contents: read
+      id-token: write  # Required for NuGet Trusted Publishing (OIDC)
+
     steps:
       - uses: actions/checkout@v4
 
@@ -58,6 +62,12 @@ jobs:
             9.0.x
             10.0.x
 
+      - name: NuGet Login (Trusted Publishing)
+        uses: NuGet/login@v1
+        id: nuget-login
+да        with:
+          user: Neftedollar
+
       - name: Restore
         run: dotnet restore
 
@@ -65,4 +75,4 @@ jobs:
         run: dotnet pack Orleans.Streaming.Redis/Orleans.Streaming.Redis.csproj --configuration Release --no-restore --output ./nupkg
 
       - name: Push to NuGet
-        run: dotnet nuget push ./nupkg/*.nupkg --api-key ${{ secrets.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json --skip-duplicate
+        run: dotnet nuget push ./nupkg/*.nupkg --api-key "${{ steps.nuget-login.outputs.NUGET_API_KEY }}" --source https://www.nuget.org/api/v2/package --skip-duplicate

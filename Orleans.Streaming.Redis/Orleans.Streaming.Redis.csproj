@@ -8,7 +8,7 @@
 
     <!-- NuGet package metadata -->
     <PackageId>Orleans.Streaming.Redis</PackageId>
-    <Version>0.2.0</Version>
+    <Version>1.0.0</Version>
     <Authors>AISwarm</Authors>
     <Description>Redis Streams persistent stream provider for Microsoft Orleans 10.x. Uses Redis Streams (XADD/XREAD/XACK) as a durable, cross-silo message transport.</Description>
     <PackageTags>orleans;streaming;redis;distributed;actors</PackageTags>
