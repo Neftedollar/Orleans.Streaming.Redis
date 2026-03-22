@@ -8,7 +8,7 @@ namespace Orleans.Streaming.Redis.Providers;
 
 /// <summary>
 /// Orleans queue adapter backed by Redis Streams.
-/// Producer side: XADD to the appropriate stream key.
+/// Producer side: XADD to the appropriate stream key (with retry on transient failures).
 /// Consumer side: creates RedisStreamReceiver per queue.
 /// </summary>
 public class RedisStreamAdapter : IQueueAdapter
@@ -53,6 +53,10 @@ public class RedisStreamAdapter : IQueueAdapter
             _loggerFactory?.CreateLogger<RedisStreamReceiver>());
     }
 
+    /// <summary>
+    /// Serializes events and enqueues them via XADD with exponential backoff retry
+    /// (3 attempts: 100ms, 200ms, 400ms) on transient Redis failures.
+    /// </summary>
     public async Task QueueMessageBatchAsync<T>(
         StreamId streamId,
         IEnumerable<T> events,
@@ -67,11 +71,37 @@ public class RedisStreamAdapter : IQueueAdapter
 
         var maxLen = _options.MaxStreamLength > 0 ? _options.MaxStreamLength : (int?)null;
 
-        await db.StreamAddAsync(
-            streamKey,
-            [new NameValueEntry("data", payload)],
-            maxLength: maxLen,
-            useApproximateMaxLength: true);
+        // Fix #1: simple exponential backoff retry — 3 attempts, 100ms/200ms/400ms.
+        const int maxAttempts = 3;
+        var delayMs = 100;
+
+        for (var attempt = 1; attempt <= maxAttempts; attempt++)
+        {
+            try
+            {
+                await db.StreamAddAsync(
+                    streamKey,
+                    [new NameValueEntry("data", payload)],
+                    maxLength: maxLen,
+                    useApproximateMaxLength: true);
+
+                RedisStreamMetrics.MessagesEnqueued.Add(1);
+                return;
+            }
+            catch (RedisException) when (attempt < maxAttempts)
+            {
+                await Task.Delay(delayMs);
+                delayMs *= 2;
+            }
+            catch (Exception)
+            {
+                RedisStreamMetrics.MessagesFailed.Add(1);
+                throw;
+            }
+        }
+
+        // Should not reach here, but satisfy the compiler.
+        RedisStreamMetrics.MessagesFailed.Add(1);
     }
 
     private byte[] SerializeBatch<T>(

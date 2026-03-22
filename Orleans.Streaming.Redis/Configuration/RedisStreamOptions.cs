@@ -49,4 +49,23 @@ public class RedisStreamOptions
     /// Redis database index. Default: -1 (use default database from connection string).
     /// </summary>
     public int Database { get; set; } = -1;
+
+    /// <summary>
+    /// Validates that all required options are set and have valid values.
+    /// </summary>
+    /// <exception cref="ArgumentException">Thrown when any option is invalid.</exception>
+    public void Validate()
+    {
+        if (string.IsNullOrWhiteSpace(ConnectionString))
+            throw new ArgumentException("ConnectionString must not be empty.", nameof(ConnectionString));
+
+        if (QueueCount <= 0)
+            throw new ArgumentException($"QueueCount must be greater than 0, was {QueueCount}.", nameof(QueueCount));
+
+        if (MaxBatchSize <= 0)
+            throw new ArgumentException($"MaxBatchSize must be greater than 0, was {MaxBatchSize}.", nameof(MaxBatchSize));
+
+        if (string.IsNullOrWhiteSpace(KeyPrefix))
+            throw new ArgumentException("KeyPrefix must not be empty.", nameof(KeyPrefix));
+    }
 }

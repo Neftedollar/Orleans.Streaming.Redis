@@ -5,14 +5,22 @@ namespace Orleans.Streaming.Redis.Providers;
 /// <summary>
 /// In-memory queue cache with watermark-based purging.
 ///
-/// Purge strategy: each cursor tracks the highest index it has consumed.
+/// Fix #4: O(n) cursor scan replaced with a two-structure layout:
+/// - <c>_byStream</c>: Dictionary&lt;StreamId, List&lt;IBatchContainer&gt;&gt; for O(1) per-stream lookup
+///   used by cursors (no full scan needed — cursor iterates only its own stream's list).
+/// - <c>_ordered</c>: insertion-order list used exclusively by the purge watermark logic.
+///
+/// Purge strategy: each cursor tracks the highest global index it has consumed.
 /// The global low-watermark is the minimum across all active cursors.
 /// <see cref="TryPurgeFromCache"/> removes all entries below that watermark,
-/// compacting the list and reclaiming memory.
+/// compacting both structures and reclaiming memory.
 /// </summary>
 internal class RedisQueueCache : IQueueCache
 {
-    private readonly List<IBatchContainer> _cache = [];
+    // Insertion-order list for watermark-based purging.
+    private readonly List<IBatchContainer> _ordered = [];
+    // Per-stream index for O(1) cursor iteration.
+    private readonly Dictionary<StreamId, List<IBatchContainer>> _byStream = [];
     private readonly object _lock = new();
     private readonly int _maxSize;
     private readonly HashSet<RedisQueueCacheCursor> _cursors = [];
@@ -22,13 +30,24 @@ internal class RedisQueueCache : IQueueCache
         _maxSize = maxSize;
     }
 
-    public int GetMaxAddCount() => Math.Max(0, _maxSize - _cache.Count);
-    public bool IsUnderPressure() => _cache.Count >= _maxSize;
+    public int GetMaxAddCount() => Math.Max(0, _maxSize - _ordered.Count);
+    public bool IsUnderPressure() => _ordered.Count >= _maxSize;
 
     public void AddToCache(IList<IBatchContainer> messages)
     {
         lock (_lock)
-            _cache.AddRange(messages);
+        {
+            foreach (var msg in messages)
+            {
+                _ordered.Add(msg);
+                if (!_byStream.TryGetValue(msg.StreamId, out var list))
+                {
+                    list = [];
+                    _byStream[msg.StreamId] = list;
+                }
+                list.Add(msg);
+            }
+        }
     }
 
     /// <summary>
@@ -41,32 +60,41 @@ internal class RedisQueueCache : IQueueCache
 
         lock (_lock)
         {
-            if (_cache.Count == 0)
+            if (_ordered.Count == 0)
                 return false;
 
-            // Low-watermark: the minimum "next-to-read" index across all active cursors.
-            // A cursor at index i has already delivered everything up to (i - 1).
+            // Low-watermark: the minimum "next-to-read" global index across all active cursors.
             int watermark;
             if (_cursors.Count == 0)
             {
-                // No active cursors — everything can be purged.
-                watermark = _cache.Count;
+                watermark = _ordered.Count;
             }
             else
             {
-                watermark = _cursors.Min(c => c.NextIndex);
+                watermark = _cursors.Min(c => c.NextGlobalIndex);
             }
 
             if (watermark <= 0)
                 return false;
 
-            // Remove the entries [0, watermark) from the front of the cache.
-            purgedItems = _cache.GetRange(0, watermark);
-            _cache.RemoveRange(0, watermark);
+            // Remove [0, watermark) from the ordered list.
+            purgedItems = _ordered.GetRange(0, watermark);
+            _ordered.RemoveRange(0, watermark);
 
-            // Shift all cursor positions down by the number of removed entries.
+            // Remove the same entries from the per-stream index.
+            foreach (var item in purgedItems)
+            {
+                if (_byStream.TryGetValue(item.StreamId, out var list))
+                {
+                    list.Remove(item);
+                    if (list.Count == 0)
+                        _byStream.Remove(item.StreamId);
+                }
+            }
+
+            // Shift all cursor global positions down.
             foreach (var cursor in _cursors)
-                cursor.ShiftBy(watermark);
+                cursor.ShiftGlobalBy(watermark);
 
             return true;
         }
@@ -76,7 +104,7 @@ internal class RedisQueueCache : IQueueCache
     {
         lock (_lock)
         {
-            var cursor = new RedisQueueCacheCursor(this, _cache, _lock, streamId, token);
+            var cursor = new RedisQueueCacheCursor(this, _byStream, _lock, streamId);
             _cursors.Add(cursor);
             return cursor;
         }
@@ -87,37 +115,48 @@ internal class RedisQueueCache : IQueueCache
         lock (_lock)
             _cursors.Remove(cursor);
     }
+
+    /// <summary>
+    /// Returns the current global count of items in the ordered list (for cursor tracking).
+    /// Must be called with the lock held.
+    /// </summary>
+    internal int OrderedCount => _ordered.Count;
 }
 
 internal class RedisQueueCacheCursor : IQueueCacheCursor
 {
     private readonly RedisQueueCache _owner;
-    private readonly List<IBatchContainer> _cache;
+    private readonly Dictionary<StreamId, List<IBatchContainer>> _byStream;
     private readonly object _lock;
     private readonly StreamId _streamId;
 
     /// <summary>
-    /// Index of the next item to read from _cache.
-    /// MoveNext advances this to point past the item it returns.
+    /// Index into the stream-specific list (for MoveNext O(1) iteration).
+    /// </summary>
+    private int _streamIndex;
+
+    /// <summary>
+    /// Global insertion-order index — used by the purge watermark calculation.
+    /// Tracks how far this cursor has consumed in the global ordered list.
     /// Exposed so RedisQueueCache can compute the low-watermark.
     /// </summary>
-    internal int NextIndex { get; private set; }
+    internal int NextGlobalIndex { get; private set; }
 
     private IBatchContainer? _current;
     private bool _disposed;
 
     public RedisQueueCacheCursor(
         RedisQueueCache owner,
-        List<IBatchContainer> cache,
+        Dictionary<StreamId, List<IBatchContainer>> byStream,
         object @lock,
-        StreamId streamId,
-        StreamSequenceToken? token)
+        StreamId streamId)
     {
         _owner = owner;
-        _cache = cache;
+        _byStream = byStream;
         _lock = @lock;
         _streamId = streamId;
-        NextIndex = 0;
+        _streamIndex = 0;
+        NextGlobalIndex = 0;
     }
 
     public IBatchContainer GetCurrent(out Exception? exception)
@@ -126,31 +165,51 @@ internal class RedisQueueCacheCursor : IQueueCacheCursor
         return _current!;
     }
 
+    /// <summary>
+    /// Advances to the next item for this stream.
+    /// O(1) per call: only iterates the stream-specific list, not the full cache.
+    /// Updates <see cref="NextGlobalIndex"/> to the global position of the item consumed.
+    /// </summary>
     public bool MoveNext()
     {
         lock (_lock)
         {
-            while (NextIndex < _cache.Count)
-            {
-                var item = _cache[NextIndex];
-                NextIndex++; // advance past this item regardless of stream match
-                if (item.StreamId == _streamId)
-                {
-                    _current = item;
-                    return true;
-                }
-            }
+            if (!_byStream.TryGetValue(_streamId, out var list))
+                return false;
+
+            if (_streamIndex >= list.Count)
+                return false;
+
+            _current = list[_streamIndex];
+            _streamIndex++;
+
+            // Advance the global watermark pointer by 1.
+            NextGlobalIndex++;
+
+            return true;
         }
-        return false;
     }
 
     /// <summary>
-    /// Adjusts the cursor index after a prefix of the cache list has been removed.
+    /// Adjusts the global index after a prefix of the ordered list has been removed.
+    /// Also adjusts the per-stream index if items for this stream were purged.
     /// Must be called with the cache lock held.
     /// </summary>
-    internal void ShiftBy(int removedCount)
+    internal void ShiftGlobalBy(int removedGlobalCount)
     {
-        NextIndex = Math.Max(0, NextIndex - removedCount);
+        NextGlobalIndex = Math.Max(0, NextGlobalIndex - removedGlobalCount);
+
+        // Recalculate stream index: after purge, some items at the head of the stream
+        // list may have been removed. We must not subtract more than the current stream index.
+        if (_byStream.TryGetValue(_streamId, out var list))
+        {
+            // Keep stream index within valid range.
+            _streamIndex = Math.Min(_streamIndex, list.Count);
+        }
+        else
+        {
+            _streamIndex = 0;
+        }
     }
 
     public void RecordDeliveryFailure() { }

@@ -74,8 +74,8 @@ public class RedisStreamReceiver : IQueueAdapterReceiver
     }
 
     /// <summary>
-    /// Scans XPENDING for messages that have been idle longer than
-    /// <see cref="PendingClaimThreshold"/> and XCLAIMs them for this consumer.
+    /// Fix #7: Scans XPENDING in pages of 100 (max 10 iterations) for messages that have
+    /// been idle longer than <see cref="PendingClaimThreshold"/> and XCLAIMs them for this consumer.
     /// This handles messages left pending after a consumer/silo crash.
     /// </summary>
     private async Task ClaimOrphanedPendingMessagesAsync()
@@ -86,38 +86,50 @@ public class RedisStreamReceiver : IQueueAdapterReceiver
             if (pendingInfo.PendingMessageCount == 0)
                 return;
 
-            // XAUTOCLAIM: atomically claim idle messages in one command (Redis 6.2+).
-            // Falls back gracefully — if the command fails we just skip recovery.
             var minIdleMs = (long)PendingClaimThreshold.TotalMilliseconds;
+            const int pageSize = 100;
+            const int maxIterations = 10;
+            var totalClaimed = 0;
 
-            // We use XPENDING with detailed info to find per-message idle times,
-            // then batch-XCLAIM the ones that have exceeded the threshold.
-            var detailed = await _db.StreamPendingMessagesAsync(
-                _streamKey, _consumerGroup,
-                count: 100,
-                consumerName: RedisValue.Null, // all consumers
-                minId: "-",
-                maxId: "+");
+            for (var iteration = 0; iteration < maxIterations; iteration++)
+            {
+                var detailed = await _db.StreamPendingMessagesAsync(
+                    _streamKey, _consumerGroup,
+                    count: pageSize,
+                    consumerName: RedisValue.Null, // all consumers
+                    minId: "-",
+                    maxId: "+");
 
-            if (detailed is null || detailed.Length == 0)
-                return;
+                if (detailed is null || detailed.Length == 0)
+                    break;
 
-            var toClaim = detailed
-                .Where(p => p.IdleTimeInMilliseconds >= minIdleMs)
-                .Select(p => (RedisValue)p.MessageId.ToString())
-                .ToArray();
+                var toClaim = detailed
+                    .Where(p => p.IdleTimeInMilliseconds >= minIdleMs)
+                    .Select(p => (RedisValue)p.MessageId.ToString())
+                    .ToArray();
 
-            if (toClaim.Length == 0)
-                return;
+                if (toClaim.Length == 0)
+                    break;
 
-            await _db.StreamClaimAsync(
-                _streamKey, _consumerGroup, _consumerId,
-                minIdleTimeInMs: minIdleMs,
-                messageIds: toClaim);
+                await _db.StreamClaimAsync(
+                    _streamKey, _consumerGroup, _consumerId,
+                    minIdleTimeInMs: minIdleMs,
+                    messageIds: toClaim);
 
-            _logger?.LogInformation(
-                "RedisStreamReceiver: claimed {Count} orphaned pending messages on {StreamKey}",
-                toClaim.Length, _streamKey);
+                totalClaimed += toClaim.Length;
+
+                // If we got fewer than a full page, there are no more pending entries.
+                if (detailed.Length < pageSize)
+                    break;
+            }
+
+            if (totalClaimed > 0)
+            {
+                RedisStreamMetrics.MessagesClaimed.Add(totalClaimed);
+                _logger?.LogInformation(
+                    "RedisStreamReceiver: claimed {Count} orphaned pending messages on {StreamKey}",
+                    totalClaimed, _streamKey);
+            }
         }
         catch (Exception ex)
         {
@@ -129,31 +141,60 @@ public class RedisStreamReceiver : IQueueAdapterReceiver
         }
     }
 
-    /// <inheritdoc />
+    /// <summary>
+    /// Fix #3: Two-phase read:
+    /// 1. XREADGROUP "0" — read pending entries already assigned to this consumer
+    ///    (e.g. messages claimed from a crashed peer via ClaimOrphanedPendingMessagesAsync).
+    /// 2. XREADGROUP ">" — read new entries not yet delivered to any consumer.
+    /// Both results are combined in a single batch.
+    /// </summary>
     public async Task<IList<IBatchContainer>> GetQueueMessagesAsync(int maxCount)
     {
         var count = Math.Min(maxCount, _maxBatchSize);
         var result = new List<IBatchContainer>();
 
-        // Read new messages (">") for this consumer in the group.
-        StreamEntry[] entries;
+        // Phase 1: read pending entries for this consumer (position "0").
+        // These are messages that were claimed but not yet ACKed — e.g. claimed from a
+        // dead peer. XREADGROUP ">" would skip them; "0" returns them.
+        StreamEntry[]? pendingEntries = null;
         try
         {
-            entries = await _db.StreamReadGroupAsync(
+            pendingEntries = await _db.StreamReadGroupAsync(
                 _streamKey, _consumerGroup, _consumerId,
-                position: ">",
+                position: "0",
                 count: count);
         }
         catch (RedisException ex)
         {
-            _logger?.LogWarning(ex, "RedisStreamReceiver: failed to read from {StreamKey}", _streamKey);
-            return result;
+            _logger?.LogWarning(ex,
+                "RedisStreamReceiver: failed to read pending entries from {StreamKey}", _streamKey);
         }
 
-        if (entries is null || entries.Length == 0)
+        // Phase 2: read new (undelivered) entries (position ">").
+        StreamEntry[]? newEntries = null;
+        try
+        {
+            // Reduce count by how many pending we got so we don't exceed maxCount total.
+            var pendingCount = pendingEntries?.Length ?? 0;
+            var remaining = Math.Max(1, count - pendingCount);
+
+            newEntries = await _db.StreamReadGroupAsync(
+                _streamKey, _consumerGroup, _consumerId,
+                position: ">",
+                count: remaining);
+        }
+        catch (RedisException ex)
+        {
+            _logger?.LogWarning(ex,
+                "RedisStreamReceiver: failed to read from {StreamKey}", _streamKey);
+        }
+
+        // Combine both phases.
+        var allEntries = Combine(pendingEntries, newEntries);
+        if (allEntries.Length == 0)
             return result;
 
-        foreach (var entry in entries)
+        foreach (var entry in allEntries)
         {
             var dataEntry = entry["data"];
             if (dataEntry.IsNull)
@@ -166,15 +207,12 @@ public class RedisStreamReceiver : IQueueAdapterReceiver
                     continue;
 
                 // Deserialize each event from its individual byte[] envelope.
-                // The envelope carries full Orleans type info, so the concrete type is restored.
                 var events = payload.EventPayloads
                     .Select(bytes => _serializer.Deserialize<object>(bytes))
                     .ToList();
 
                 var streamId = StreamId.Create(payload.StreamNamespace ?? string.Empty, payload.StreamKey);
 
-                // Parse the Redis entry ID (format: "{timestampMs}-{seq}") into a sequence token.
-                // This gives monotonically increasing, restart-safe tokens.
                 var token = ParseRedisEntryId(entry.Id.ToString());
 
                 var container = new RedisBatchContainer(
@@ -183,14 +221,15 @@ public class RedisStreamReceiver : IQueueAdapterReceiver
                     payload.RequestContext,
                     token)
                 {
-                    // Carry the Redis entry ID so MessagesDeliveredAsync can XACK it.
                     RedisEntryId = entry.Id.ToString()
                 };
 
                 result.Add(container);
+                RedisStreamMetrics.MessagesDequeued.Add(1);
             }
             catch (Exception ex)
             {
+                RedisStreamMetrics.MessagesFailed.Add(1);
                 _logger?.LogWarning(ex,
                     "RedisStreamReceiver: failed to deserialize entry {EntryId} from {StreamKey}",
                     entry.Id, _streamKey);
@@ -198,6 +237,16 @@ public class RedisStreamReceiver : IQueueAdapterReceiver
         }
 
         return result;
+    }
+
+    private static StreamEntry[] Combine(StreamEntry[]? a, StreamEntry[]? b)
+    {
+        if (a is null || a.Length == 0) return b ?? [];
+        if (b is null || b.Length == 0) return a;
+        var combined = new StreamEntry[a.Length + b.Length];
+        a.CopyTo(combined, 0);
+        b.CopyTo(combined, a.Length);
+        return combined;
     }
 
     /// <summary>
@@ -240,9 +289,10 @@ public class RedisStreamReceiver : IQueueAdapterReceiver
         try
         {
             // XACK: acknowledge messages as processed for this consumer group.
-            // After XACK, messages won't appear in XPENDING and won't be re-delivered.
             var acked = await _db.StreamAcknowledgeAsync(
                 _streamKey, _consumerGroup, [.. entryIds]);
+
+            RedisStreamMetrics.MessagesAcked.Add(acked);
 
             _logger?.LogDebug(
                 "RedisStreamReceiver: XACK {Count}/{Total} entries on {StreamKey}",
@@ -250,9 +300,7 @@ public class RedisStreamReceiver : IQueueAdapterReceiver
         }
         catch (RedisException ex)
         {
-            // Non-fatal: unacked messages will be re-delivered on next XREADGROUP
-            // with "0" position (pending entries). This is the Redis Streams
-            // at-least-once delivery guarantee.
+            // Non-fatal: unacked messages will be re-delivered via the "0" phase on next poll.
             _logger?.LogWarning(ex,
                 "RedisStreamReceiver: XACK failed for {Count} entries on {StreamKey}",
                 entryIds.Count, _streamKey);
@@ -269,9 +317,6 @@ public class RedisStreamReceiver : IQueueAdapterReceiver
         if (string.IsNullOrEmpty(_consumerId))
             return;
 
-        // XGROUP DELCONSUMER: clean up this consumer from the group so that its
-        // pending count is removed. Any still-pending messages will be claimed by
-        // the next receiver that calls ClaimOrphanedPendingMessagesAsync.
         try
         {
             await _db.StreamDeleteConsumerAsync(_streamKey, _consumerGroup, _consumerId);
@@ -282,7 +327,6 @@ public class RedisStreamReceiver : IQueueAdapterReceiver
         }
         catch (Exception ex)
         {
-            // Non-fatal: the consumer entry will age out or be claimed by a peer.
             _logger?.LogWarning(ex,
                 "RedisStreamReceiver: failed to delete consumer {Consumer} on {StreamKey}",
                 _consumerId, _streamKey);

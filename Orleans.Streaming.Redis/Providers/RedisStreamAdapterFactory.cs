@@ -10,8 +10,9 @@ namespace Orleans.Streaming.Redis.Providers;
 /// <summary>
 /// Factory that creates RedisStreamAdapter instances.
 /// Manages the Redis connection lifecycle and queue mapper.
+/// Implements <see cref="IAsyncDisposable"/> for clean shutdown.
 /// </summary>
-public class RedisStreamAdapterFactory : IQueueAdapterFactory
+public class RedisStreamAdapterFactory : IQueueAdapterFactory, IAsyncDisposable
 {
     private readonly string _providerName;
     private readonly RedisStreamOptions _options;
@@ -35,7 +36,16 @@ public class RedisStreamAdapterFactory : IQueueAdapterFactory
 
     public async Task<IQueueAdapter> CreateAdapter()
     {
-        _redis = await ConnectionMultiplexer.ConnectAsync(_options.ConnectionString);
+        // Fix #6: validate options before attempting to connect.
+        _options.Validate();
+
+        // Fix #2: configure ConnectionMultiplexer with reconnect settings.
+        var configOptions = ConfigurationOptions.Parse(_options.ConnectionString);
+        configOptions.AbortOnConnectFail = false;
+        configOptions.ConnectRetry = 3;
+        configOptions.ReconnectRetryPolicy = new ExponentialRetry(100);
+
+        _redis = await ConnectionMultiplexer.ConnectAsync(configOptions);
 
         return new RedisStreamAdapter(
             _providerName,
@@ -54,6 +64,19 @@ public class RedisStreamAdapterFactory : IQueueAdapterFactory
 
     public Task<IStreamFailureHandler> GetDeliveryFailureHandler(QueueId queueId)
         => Task.FromResult<IStreamFailureHandler>(new NoOpStreamDeliveryFailureHandler());
+
+    /// <summary>
+    /// Fix #8: dispose the ConnectionMultiplexer on shutdown.
+    /// </summary>
+    public async ValueTask DisposeAsync()
+    {
+        if (_redis is not null)
+        {
+            await _redis.CloseAsync();
+            _redis.Dispose();
+            _redis = null;
+        }
+    }
 
     /// <summary>
     /// Creates the factory from DI. Used as the delegate for AddPersistentStreams.

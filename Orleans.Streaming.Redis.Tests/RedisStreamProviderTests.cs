@@ -1,3 +1,4 @@
+using System.Diagnostics.Metrics;
 using Orleans.Providers.Streams.Common;
 using Orleans.Streams;
 using Orleans.Streaming.Redis.Configuration;
@@ -126,6 +127,62 @@ public class RedisStreamOptionsTests
             Assert.That(opts.MaxStreamLength, Is.EqualTo(5000));
             Assert.That(opts.Database, Is.EqualTo(3));
         });
+    }
+
+    // Fix #6 validation tests
+    [Test]
+    public void Validate_EmptyConnectionString_Throws()
+    {
+        var opts = new RedisStreamOptions { ConnectionString = "" };
+        Assert.Throws<ArgumentException>(() => opts.Validate());
+    }
+
+    [Test]
+    public void Validate_WhitespaceConnectionString_Throws()
+    {
+        var opts = new RedisStreamOptions { ConnectionString = "   " };
+        Assert.Throws<ArgumentException>(() => opts.Validate());
+    }
+
+    [Test]
+    public void Validate_ZeroQueueCount_Throws()
+    {
+        var opts = new RedisStreamOptions { ConnectionString = "localhost", QueueCount = 0 };
+        Assert.Throws<ArgumentException>(() => opts.Validate());
+    }
+
+    [Test]
+    public void Validate_NegativeQueueCount_Throws()
+    {
+        var opts = new RedisStreamOptions { ConnectionString = "localhost", QueueCount = -1 };
+        Assert.Throws<ArgumentException>(() => opts.Validate());
+    }
+
+    [Test]
+    public void Validate_ZeroMaxBatchSize_Throws()
+    {
+        var opts = new RedisStreamOptions { ConnectionString = "localhost", MaxBatchSize = 0 };
+        Assert.Throws<ArgumentException>(() => opts.Validate());
+    }
+
+    [Test]
+    public void Validate_EmptyKeyPrefix_Throws()
+    {
+        var opts = new RedisStreamOptions { ConnectionString = "localhost", KeyPrefix = "" };
+        Assert.Throws<ArgumentException>(() => opts.Validate());
+    }
+
+    [Test]
+    public void Validate_ValidOptions_DoesNotThrow()
+    {
+        var opts = new RedisStreamOptions
+        {
+            ConnectionString = "localhost:6379",
+            QueueCount = 4,
+            MaxBatchSize = 50,
+            KeyPrefix = "test:stream"
+        };
+        Assert.DoesNotThrow(() => opts.Validate());
     }
 }
 
@@ -339,5 +396,159 @@ public class RedisQueueCacheTests
         });
 
         Assert.That(cache.IsUnderPressure(), Is.True);
+    }
+
+    // Fix #4: verify that cursor only sees items for its own stream (O(1) behaviour).
+    [Test]
+    public void Cursor_MoveNext_OnlyReturnsSameStreamId()
+    {
+        var cache = new RedisQueueCache(128);
+        var streamA = StreamId.Create("ns", "a");
+        var streamB = StreamId.Create("ns", "b");
+
+        cache.AddToCache(new List<IBatchContainer>
+        {
+            MakeContainer("ns", "a", 1),
+            MakeContainer("ns", "b", 10),
+            MakeContainer("ns", "a", 2),
+            MakeContainer("ns", "b", 20),
+            MakeContainer("ns", "a", 3),
+        });
+
+        using var cursor = cache.GetCacheCursor(streamA, null);
+        var items = new List<IBatchContainer>();
+        while (cursor.MoveNext())
+            items.Add(cursor.GetCurrent(out _));
+
+        Assert.That(items, Has.Count.EqualTo(3), "Cursor should see only stream A items");
+        Assert.That(items.All(i => i.StreamId == streamA), Is.True);
+    }
+}
+
+/// <summary>
+/// Unit tests for metrics counters (Fix #5).
+/// Uses MeterListener to observe counter increments without a real Redis connection.
+/// </summary>
+public class RedisStreamMetricsTests
+{
+    [Test]
+    public void MetricsCounters_AreDefinedWithCorrectMeterName()
+    {
+        // Verify static counter references are non-null and correctly named.
+        Assert.That(RedisStreamMetrics.MessagesEnqueued, Is.Not.Null);
+        Assert.That(RedisStreamMetrics.MessagesDequeued, Is.Not.Null);
+        Assert.That(RedisStreamMetrics.MessagesAcked, Is.Not.Null);
+        Assert.That(RedisStreamMetrics.MessagesFailed, Is.Not.Null);
+        Assert.That(RedisStreamMetrics.MessagesClaimed, Is.Not.Null);
+    }
+
+    [Test]
+    public void MessagesEnqueued_Counter_Increments()
+    {
+        long observed = 0;
+
+        using var listener = new MeterListener();
+        listener.InstrumentPublished = (instrument, l) =>
+        {
+            if (instrument.Meter.Name == "Orleans.Streaming.Redis"
+                && instrument.Name == "orleans.streaming.redis.messages_enqueued")
+                l.EnableMeasurementEvents(instrument);
+        };
+        listener.SetMeasurementEventCallback<long>((_, measurement, _, _) =>
+            Interlocked.Add(ref observed, measurement));
+        listener.Start();
+
+        RedisStreamMetrics.MessagesEnqueued.Add(3);
+        listener.RecordObservableInstruments();
+
+        Assert.That(observed, Is.EqualTo(3));
+    }
+
+    [Test]
+    public void MessagesDequeued_Counter_Increments()
+    {
+        long observed = 0;
+
+        using var listener = new MeterListener();
+        listener.InstrumentPublished = (instrument, l) =>
+        {
+            if (instrument.Meter.Name == "Orleans.Streaming.Redis"
+                && instrument.Name == "orleans.streaming.redis.messages_dequeued")
+                l.EnableMeasurementEvents(instrument);
+        };
+        listener.SetMeasurementEventCallback<long>((_, measurement, _, _) =>
+            Interlocked.Add(ref observed, measurement));
+        listener.Start();
+
+        RedisStreamMetrics.MessagesDequeued.Add(5);
+        listener.RecordObservableInstruments();
+
+        Assert.That(observed, Is.EqualTo(5));
+    }
+
+    [Test]
+    public void MessagesAcked_Counter_Increments()
+    {
+        long observed = 0;
+
+        using var listener = new MeterListener();
+        listener.InstrumentPublished = (instrument, l) =>
+        {
+            if (instrument.Meter.Name == "Orleans.Streaming.Redis"
+                && instrument.Name == "orleans.streaming.redis.messages_acked")
+                l.EnableMeasurementEvents(instrument);
+        };
+        listener.SetMeasurementEventCallback<long>((_, measurement, _, _) =>
+            Interlocked.Add(ref observed, measurement));
+        listener.Start();
+
+        RedisStreamMetrics.MessagesAcked.Add(2);
+        listener.RecordObservableInstruments();
+
+        Assert.That(observed, Is.EqualTo(2));
+    }
+
+    [Test]
+    public void MessagesFailed_Counter_Increments()
+    {
+        long observed = 0;
+
+        using var listener = new MeterListener();
+        listener.InstrumentPublished = (instrument, l) =>
+        {
+            if (instrument.Meter.Name == "Orleans.Streaming.Redis"
+                && instrument.Name == "orleans.streaming.redis.messages_failed")
+                l.EnableMeasurementEvents(instrument);
+        };
+        listener.SetMeasurementEventCallback<long>((_, measurement, _, _) =>
+            Interlocked.Add(ref observed, measurement));
+        listener.Start();
+
+        RedisStreamMetrics.MessagesFailed.Add(1);
+        listener.RecordObservableInstruments();
+
+        Assert.That(observed, Is.EqualTo(1));
+    }
+
+    [Test]
+    public void MessagesClaimed_Counter_Increments()
+    {
+        long observed = 0;
+
+        using var listener = new MeterListener();
+        listener.InstrumentPublished = (instrument, l) =>
+        {
+            if (instrument.Meter.Name == "Orleans.Streaming.Redis"
+                && instrument.Name == "orleans.streaming.redis.messages_claimed")
+                l.EnableMeasurementEvents(instrument);
+        };
+        listener.SetMeasurementEventCallback<long>((_, measurement, _, _) =>
+            Interlocked.Add(ref observed, measurement));
+        listener.Start();
+
+        RedisStreamMetrics.MessagesClaimed.Add(7);
+        listener.RecordObservableInstruments();
+
+        Assert.That(observed, Is.EqualTo(7));
     }
 }
