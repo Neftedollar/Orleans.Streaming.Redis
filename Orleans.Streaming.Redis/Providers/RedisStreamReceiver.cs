@@ -336,7 +336,7 @@ public class RedisStreamReceiver : IQueueAdapterReceiver
     /// <c>eventIndex</c>, giving a globally unique, monotonically increasing token.
     /// Falls back to a zero token if parsing fails.
     /// </summary>
-    private static EventSequenceTokenV2 ParseRedisEntryId(string entryId)
+    internal static EventSequenceTokenV2 ParseRedisEntryId(string entryId)
     {
         var dashIndex = entryId.IndexOf('-');
         if (dashIndex > 0

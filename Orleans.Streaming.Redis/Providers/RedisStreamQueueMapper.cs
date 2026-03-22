@@ -68,7 +68,7 @@ public class RedisStreamQueueMapper : IConsistentRingStreamQueueMapper
     /// Unlike <c>string.GetHashCode()</c>, this is not randomised per-process,
     /// ensuring that all silos map the same <see cref="StreamId"/> to the same partition.
     /// </summary>
-    private static uint StableHash(string input)
+    internal static uint StableHash(string input)
     {
         uint hash = 2166136261;
         foreach (var c in input)
