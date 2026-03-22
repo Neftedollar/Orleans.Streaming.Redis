@@ -34,6 +34,14 @@ public class RedisStreamReceiver : IQueueAdapterReceiver
     private string _consumerId = string.Empty;
 
     /// <summary>
+    /// Tracks entry IDs that have been read from Redis (via XREADGROUP ">") but not yet
+    /// acknowledged. Used to prevent phase-1 ("0") re-reads from returning messages that are
+    /// currently in-flight (being delivered to subscribers). Only messages that have been in
+    /// the PEL since before this consumer's lifetime (crash recovery) should come from phase-1.
+    /// </summary>
+    private readonly HashSet<string> _inFlightEntryIds = [];
+
+    /// <summary>
     /// Initialises a new <see cref="RedisStreamReceiver"/>.
     /// </summary>
     /// <param name="streamKey">Redis Stream key for this queue partition.</param>
@@ -173,16 +181,23 @@ public class RedisStreamReceiver : IQueueAdapterReceiver
         var result = new List<IBatchContainer>();
 
         // Phase 1: read pending entries for this consumer (position "0").
-        // Budget is capped at half of total count to prevent pending messages from
-        // starving new messages when the pending queue is large.
+        // These are entries that were assigned to this consumer but not yet ACK'd.
+        // Entries that are currently in-flight (tracked by _inFlightEntryIds) are skipped
+        // here to avoid re-delivering messages that are already being processed.
         var phase1Budget = Math.Max(1, count / 2);
         StreamEntry[]? pendingEntries = null;
         try
         {
-            pendingEntries = await _db.StreamReadGroupAsync(
+            var rawPending = await _db.StreamReadGroupAsync(
                 _streamKey, _consumerGroup, _consumerId,
                 position: "0",
                 count: phase1Budget);
+
+            // Exclude entries already tracked as in-flight to prevent double-delivery
+            // during the window between a XREADGROUP ">" read and its XACK.
+            pendingEntries = rawPending is null || rawPending.Length == 0
+                ? rawPending
+                : rawPending.Where(e => !_inFlightEntryIds.Contains(e.Id.ToString())).ToArray();
         }
         catch (RedisException ex)
         {
@@ -202,6 +217,13 @@ public class RedisStreamReceiver : IQueueAdapterReceiver
                 _streamKey, _consumerGroup, _consumerId,
                 position: ">",
                 count: remaining);
+
+            // Track new entries as in-flight until they are ACK'd.
+            if (newEntries is not null)
+            {
+                foreach (var entry in newEntries)
+                    _inFlightEntryIds.Add(entry.Id.ToString());
+            }
         }
         catch (RedisException ex)
         {
@@ -355,10 +377,16 @@ public class RedisStreamReceiver : IQueueAdapterReceiver
             _logger?.LogDebug(
                 "RedisStreamReceiver: XACK {Count}/{Total} entries on {StreamKey}",
                 acked, entryIds.Count, _streamKey);
+
+            // Remove ACK'd entries from the in-flight set.
+            foreach (var id in entryIds)
+                _inFlightEntryIds.Remove((string)id!);
         }
         catch (RedisException ex)
         {
             // Non-fatal: unacked messages will be re-delivered via the "0" phase on next poll.
+            // Note: in-flight IDs remain in the set so they are still excluded from phase-1
+            // re-reads until ACK succeeds on a subsequent attempt.
             _logger?.LogWarning(ex,
                 "RedisStreamReceiver: XACK failed for {Count} entries on {StreamKey}",
                 entryIds.Count, _streamKey);
@@ -371,6 +399,8 @@ public class RedisStreamReceiver : IQueueAdapterReceiver
         _logger?.LogInformation(
             "RedisStreamReceiver shutting down: stream={StreamKey}, consumer={Consumer}",
             _streamKey, _consumerId);
+
+        _inFlightEntryIds.Clear();
 
         if (string.IsNullOrEmpty(_consumerId))
             return;

@@ -53,6 +53,9 @@ internal class RedisQueueCache : IQueueCache
     /// <summary>
     /// Purges cache entries that all active cursors have already advanced past.
     /// Returns true (and the removed items) when at least one item was purged.
+    ///
+    /// Idle cursors (whose stream-specific list is exhausted) do not contribute to
+    /// the low-watermark — they would never block purges for other streams' items.
     /// </summary>
     public bool TryPurgeFromCache(out IList<IBatchContainer>? purgedItems)
     {
@@ -63,7 +66,10 @@ internal class RedisQueueCache : IQueueCache
             if (_ordered.Count == 0)
                 return false;
 
-            // Low-watermark: the minimum "next-to-read" global index across all active cursors.
+            // Low-watermark: the minimum effective global index across all active cursors.
+            // A cursor is "active" if it has unconsumed items in its stream-specific list.
+            // An "idle" cursor (stream empty or exhausted) contributes _ordered.Count so
+            // it does not block purges for items it will never consume.
             int watermark;
             if (_cursors.Count == 0)
             {
@@ -71,7 +77,13 @@ internal class RedisQueueCache : IQueueCache
             }
             else
             {
-                watermark = _cursors.Min(c => c.NextGlobalIndex);
+                watermark = _ordered.Count; // start optimistically at end
+                foreach (var cursor in _cursors)
+                {
+                    var effective = cursor.EffectiveWatermark(_byStream, _ordered.Count);
+                    if (effective < watermark)
+                        watermark = effective;
+                }
             }
 
             if (watermark <= 0)
@@ -81,9 +93,14 @@ internal class RedisQueueCache : IQueueCache
             purgedItems = _ordered.GetRange(0, watermark);
             _ordered.RemoveRange(0, watermark);
 
-            // Remove the same entries from the per-stream index.
+            // Count how many items are being removed per stream so cursors can
+            // adjust their per-stream index correctly.
+            var removedPerStream = new Dictionary<StreamId, int>();
             foreach (var item in purgedItems)
             {
+                removedPerStream.TryGetValue(item.StreamId, out var n);
+                removedPerStream[item.StreamId] = n + 1;
+
                 if (_byStream.TryGetValue(item.StreamId, out var list))
                 {
                     list.Remove(item);
@@ -92,9 +109,12 @@ internal class RedisQueueCache : IQueueCache
                 }
             }
 
-            // Shift all cursor global positions down.
+            // Shift all cursor global positions down, passing per-stream removal counts.
             foreach (var cursor in _cursors)
-                cursor.ShiftGlobalBy(watermark);
+            {
+                removedPerStream.TryGetValue(cursor.StreamId, out var streamRemoved);
+                cursor.ShiftGlobalBy(watermark, streamRemoved);
+            }
 
             return true;
         }
@@ -155,6 +175,27 @@ internal class RedisQueueCacheCursor : IQueueCacheCursor
     /// </summary>
     internal int NextGlobalIndex { get; private set; }
 
+    /// <summary>The stream ID this cursor is tracking. Exposed for per-stream purge accounting.</summary>
+    internal StreamId StreamId => _streamId;
+
+    /// <summary>
+    /// Returns the effective watermark for purge calculation.
+    /// If this cursor still has unconsumed items in its stream-specific list, returns
+    /// <see cref="NextGlobalIndex"/> (blocks purge at last consumed position).
+    /// If the cursor is idle (stream list exhausted or absent), returns
+    /// <paramref name="orderedCount"/> so the idle cursor does not block purges.
+    /// Must be called with the cache lock held.
+    /// </summary>
+    internal int EffectiveWatermark(Dictionary<StreamId, List<IBatchContainer>> byStream, int orderedCount)
+    {
+        if (!byStream.TryGetValue(_streamId, out var list) || _streamIndex >= list.Count)
+        {
+            // Idle: no more items to consume — don't block purges.
+            return orderedCount;
+        }
+        return NextGlobalIndex;
+    }
+
     private IBatchContainer? _current;
     private bool _disposed;
 
@@ -209,19 +250,28 @@ internal class RedisQueueCacheCursor : IQueueCacheCursor
     }
 
     /// <summary>
-    /// Adjusts the global index after a prefix of the ordered list has been removed.
-    /// Also adjusts the per-stream index if items for this stream were purged.
-    /// Must be called with the cache lock held.
+    /// Adjusts the global index and per-stream index after a prefix of the ordered list
+    /// has been removed.
     /// </summary>
-    internal void ShiftGlobalBy(int removedGlobalCount)
+    /// <param name="removedGlobalCount">Number of items removed from the global ordered list.</param>
+    /// <param name="removedStreamCount">
+    /// Number of items removed from this cursor's stream-specific list.
+    /// The cursor's <c>_streamIndex</c> must be decremented by this amount so it
+    /// continues to point at the correct next-to-deliver item after items that
+    /// have already been consumed are purged from the head of the stream list.
+    /// </param>
+    internal void ShiftGlobalBy(int removedGlobalCount, int removedStreamCount = 0)
     {
         NextGlobalIndex = Math.Max(0, NextGlobalIndex - removedGlobalCount);
 
-        // Recalculate stream index: after purge, some items at the head of the stream
-        // list may have been removed. We must not subtract more than the current stream index.
+        // Adjust the per-stream index: items that were already delivered (before _streamIndex)
+        // may have been purged from the head of the stream list. Decrement _streamIndex by the
+        // number of removed items to keep it pointing at the correct next item.
+        _streamIndex = Math.Max(0, _streamIndex - removedStreamCount);
+
+        // Safety clamp: don't exceed the current list length.
         if (_byStream.TryGetValue(_streamId, out var list))
         {
-            // Keep stream index within valid range.
             _streamIndex = Math.Min(_streamIndex, list.Count);
         }
         else

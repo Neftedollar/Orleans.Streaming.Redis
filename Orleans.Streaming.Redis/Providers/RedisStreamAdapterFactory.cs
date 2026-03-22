@@ -74,7 +74,11 @@ public class RedisStreamAdapterFactory : IQueueAdapterFactory, IAsyncDisposable
 
     /// <inheritdoc />
     public Task<IStreamFailureHandler> GetDeliveryFailureHandler(QueueId queueId)
-        => Task.FromResult<IStreamFailureHandler>(new NoOpStreamDeliveryFailureHandler());
+    {
+        var logger = _loggerFactory?.CreateLogger<LoggingStreamDeliveryFailureHandler>()
+                     ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<LoggingStreamDeliveryFailureHandler>.Instance;
+        return Task.FromResult<IStreamFailureHandler>(new LoggingStreamDeliveryFailureHandler(logger));
+    }
 
     /// <summary>
     /// Fix #8: dispose the ConnectionMultiplexer on shutdown.
