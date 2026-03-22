@@ -126,6 +126,14 @@ Each silo runs a pulling agent per queue partition. Messages are distributed acr
 - [ ] Optional JSON payload mode for non-Orleans consumers (v0.2, see TODO above)
 - [ ] Connection pooling / multi-connection support for high-throughput scenarios
 
+## Documentation
+
+- **[Getting Started](docs/getting-started.md)** — install, configure, produce, consume in 5 minutes
+- **[Configuration Reference](docs/configuration.md)** — all options, pulling agent tuning, client setup, multiple providers
+- **[Architecture](docs/architecture.md)** — data flow, components, serialization, crash recovery, metrics
+- **[Production Deployment](docs/production.md)** — Redis sizing, HA, monitoring, scaling, Docker Compose
+- **[Troubleshooting](docs/troubleshooting.md)** — common issues, Redis CLI debugging, logging
+
 Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
