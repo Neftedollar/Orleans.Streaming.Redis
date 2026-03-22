@@ -51,6 +51,21 @@ public class RedisStreamOptions
     public int Database { get; set; } = -1;
 
     /// <summary>
+    /// In-memory cache size (number of batch containers) per queue partition.
+    /// Default: 4096.
+    /// </summary>
+    public int CacheSize { get; set; } = 4096;
+
+    /// <summary>
+    /// Key prefix for the dead-letter stream. When set, messages that fail deserialization
+    /// are forwarded to a Redis Stream at <c>{DeadLetterPrefix}:{queueIndex}</c> instead
+    /// of being silently discarded. The failed entry is XACK'd from the main stream so
+    /// it does not block future processing.
+    /// Default: <see langword="null"/> (dead-letter disabled).
+    /// </summary>
+    public string? DeadLetterPrefix { get; set; } = null;
+
+    /// <summary>
     /// Validates that all required options are set and have valid values.
     /// </summary>
     /// <exception cref="ArgumentException">Thrown when any option is invalid.</exception>
@@ -67,5 +82,8 @@ public class RedisStreamOptions
 
         if (string.IsNullOrWhiteSpace(KeyPrefix))
             throw new ArgumentException("KeyPrefix must not be empty.", nameof(KeyPrefix));
+
+        if (CacheSize <= 0)
+            throw new ArgumentException($"CacheSize must be greater than 0, was {CacheSize}.", nameof(CacheSize));
     }
 }

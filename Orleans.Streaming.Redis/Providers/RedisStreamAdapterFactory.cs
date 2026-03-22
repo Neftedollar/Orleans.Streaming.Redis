@@ -21,6 +21,13 @@ public class RedisStreamAdapterFactory : IQueueAdapterFactory, IAsyncDisposable
     private readonly RedisStreamQueueMapper _queueMapper;
     private IConnectionMultiplexer? _redis;
 
+    /// <summary>
+    /// Initialises the factory.
+    /// </summary>
+    /// <param name="providerName">Stream provider name.</param>
+    /// <param name="options">Redis stream configuration.</param>
+    /// <param name="serializer">Orleans serializer.</param>
+    /// <param name="loggerFactory">Optional logger factory.</param>
     public RedisStreamAdapterFactory(
         string providerName,
         RedisStreamOptions options,
@@ -34,6 +41,7 @@ public class RedisStreamAdapterFactory : IQueueAdapterFactory, IAsyncDisposable
         _queueMapper = new RedisStreamQueueMapper(options.QueueCount, providerName);
     }
 
+    /// <inheritdoc />
     public async Task<IQueueAdapter> CreateAdapter()
     {
         // Fix #6: validate options before attempting to connect.
@@ -56,12 +64,15 @@ public class RedisStreamAdapterFactory : IQueueAdapterFactory, IAsyncDisposable
             _loggerFactory);
     }
 
+    /// <inheritdoc />
     public IQueueAdapterCache GetQueueAdapterCache()
-        => new SimpleQueueAdapterCache(_providerName);
+        => new SimpleQueueAdapterCache(_providerName, _options.CacheSize);
 
+    /// <inheritdoc />
     public IStreamQueueMapper GetStreamQueueMapper()
         => _queueMapper;
 
+    /// <inheritdoc />
     public Task<IStreamFailureHandler> GetDeliveryFailureHandler(QueueId queueId)
         => Task.FromResult<IStreamFailureHandler>(new NoOpStreamDeliveryFailureHandler());
 
@@ -92,16 +103,25 @@ public class RedisStreamAdapterFactory : IQueueAdapterFactory, IAsyncDisposable
 
 /// <summary>
 /// Minimal queue adapter cache wrapping <see cref="RedisQueueCache"/>.
+/// Cache size is configurable via <see cref="RedisStreamOptions.CacheSize"/>.
 /// </summary>
 internal class SimpleQueueAdapterCache : IQueueAdapterCache
 {
     private readonly string _providerName;
+    private readonly int _cacheSize;
 
-    public SimpleQueueAdapterCache(string providerName)
+    /// <summary>
+    /// Initialises the cache factory.
+    /// </summary>
+    /// <param name="providerName">Orleans stream provider name.</param>
+    /// <param name="cacheSize">Maximum number of batch containers to hold per partition cache.</param>
+    public SimpleQueueAdapterCache(string providerName, int cacheSize = 4096)
     {
         _providerName = providerName;
+        _cacheSize = cacheSize;
     }
 
+    /// <summary>Creates a new per-queue cache for the specified queue partition.</summary>
     public IQueueCache CreateQueueCache(QueueId queueId)
-        => new RedisQueueCache(4096);
+        => new RedisQueueCache(_cacheSize);
 }

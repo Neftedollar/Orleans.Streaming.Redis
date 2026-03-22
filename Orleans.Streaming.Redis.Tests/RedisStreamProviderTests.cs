@@ -552,3 +552,232 @@ public class RedisStreamMetricsTests
         Assert.That(observed, Is.EqualTo(7));
     }
 }
+
+/// <summary>
+/// Tests for fix #1 — FNV-1a stable hash in GetQueueForStream.
+/// </summary>
+public class StableHashTests
+{
+    [Test]
+    public void GetQueueForStream_SameInput_AlwaysReturnsSameQueue()
+    {
+        // Run 1000 times to guard against accidental false-positives.
+        var mapper = new RedisStreamQueueMapper(8, "test");
+        var streamId = StreamId.Create("ns", "consistent-key");
+
+        var first = mapper.GetQueueForStream(streamId);
+        for (var i = 0; i < 1000; i++)
+            Assert.That(mapper.GetQueueForStream(streamId), Is.EqualTo(first),
+                "StableHash must return the same result for the same input on every call");
+    }
+
+    [Test]
+    public void GetQueueForStream_DifferentProviderInstances_SameMapping()
+    {
+        // Two independent mapper instances must produce identical queue assignments
+        // for the same stream ID (simulates two silos with independent instances).
+        var mapper1 = new RedisStreamQueueMapper(16, "provider");
+        var mapper2 = new RedisStreamQueueMapper(16, "provider");
+
+        for (var i = 0; i < 50; i++)
+        {
+            var streamId = StreamId.Create("ns", $"key-{i}");
+            Assert.That(mapper2.GetQueueForStream(streamId), Is.EqualTo(mapper1.GetQueueForStream(streamId)),
+                $"Both silo instances must map stream 'key-{i}' to the same partition");
+        }
+    }
+
+    [Test]
+    public void GetQueueForStream_DistributesAcrossAllQueues()
+    {
+        // With 100 distinct stream IDs we should hit more than one partition out of 8.
+        var mapper = new RedisStreamQueueMapper(8, "test");
+        var seen = new HashSet<QueueId>();
+        for (var i = 0; i < 100; i++)
+            seen.Add(mapper.GetQueueForStream(StreamId.Create("ns", $"stream-{i}")));
+
+        Assert.That(seen.Count, Is.GreaterThan(1),
+            "FNV-1a hash should distribute 100 streams across more than 1 partition");
+    }
+}
+
+/// <summary>
+/// Tests for fix #2 — GetCacheCursor respects the stream sequence token (rewind support).
+/// </summary>
+public class RewindCursorTests
+{
+    private static RedisBatchContainer MakeContainer(string key, long seq)
+    {
+        var streamId = StreamId.Create("ns", key);
+        var token = new EventSequenceTokenV2(seq);
+        return new RedisBatchContainer(streamId, [$"evt-{seq}"], null, token);
+    }
+
+    [Test]
+    public void GetCacheCursor_NullToken_StartsFromBeginning()
+    {
+        var cache = new RedisQueueCache(128);
+        var streamId = StreamId.Create("ns", "k");
+        cache.AddToCache(new List<IBatchContainer>
+        {
+            MakeContainer("k", 10),
+            MakeContainer("k", 20),
+            MakeContainer("k", 30),
+        });
+
+        using var cursor = cache.GetCacheCursor(streamId, null);
+        var items = new List<long>();
+        while (cursor.MoveNext())
+            items.Add(((EventSequenceTokenV2)cursor.GetCurrent(out _).SequenceToken).SequenceNumber);
+
+        Assert.That(items, Is.EqualTo(new[] { 10L, 20L, 30L }),
+            "Null token should start from the first item in the cache");
+    }
+
+    [Test]
+    public void GetCacheCursor_WithToken_SkipsItemsBeforeToken()
+    {
+        var cache = new RedisQueueCache(128);
+        var streamId = StreamId.Create("ns", "k");
+        cache.AddToCache(new List<IBatchContainer>
+        {
+            MakeContainer("k", 10),
+            MakeContainer("k", 20),
+            MakeContainer("k", 30),
+            MakeContainer("k", 40),
+        });
+
+        // Request cursor starting at seq=20; items 10 should be skipped.
+        var startToken = new EventSequenceTokenV2(20);
+        using var cursor = cache.GetCacheCursor(streamId, startToken);
+        var items = new List<long>();
+        while (cursor.MoveNext())
+            items.Add(((EventSequenceTokenV2)cursor.GetCurrent(out _).SequenceToken).SequenceNumber);
+
+        Assert.That(items, Is.EqualTo(new[] { 20L, 30L, 40L }),
+            "Cursor should start at the first item >= the requested token");
+    }
+
+    [Test]
+    public void GetCacheCursor_WithTokenBeyondCache_ReturnsEmpty()
+    {
+        var cache = new RedisQueueCache(128);
+        var streamId = StreamId.Create("ns", "k");
+        cache.AddToCache(new List<IBatchContainer>
+        {
+            MakeContainer("k", 10),
+            MakeContainer("k", 20),
+        });
+
+        // Token is beyond all cached items.
+        var startToken = new EventSequenceTokenV2(100);
+        using var cursor = cache.GetCacheCursor(streamId, startToken);
+
+        Assert.That(cursor.MoveNext(), Is.False,
+            "Cursor with token beyond cached range should return no items");
+    }
+
+    [Test]
+    public void GetCacheCursor_WithTokenBeforeAll_SameAsNull()
+    {
+        var cache = new RedisQueueCache(128);
+        var streamId = StreamId.Create("ns", "k");
+        cache.AddToCache(new List<IBatchContainer>
+        {
+            MakeContainer("k", 10),
+            MakeContainer("k", 20),
+        });
+
+        // Token before first item — should include all cached items.
+        var startToken = new EventSequenceTokenV2(5);
+        using var cursor = cache.GetCacheCursor(streamId, startToken);
+        var items = new List<long>();
+        while (cursor.MoveNext())
+            items.Add(((EventSequenceTokenV2)cursor.GetCurrent(out _).SequenceToken).SequenceNumber);
+
+        Assert.That(items, Is.EqualTo(new[] { 10L, 20L }),
+            "Token before all cached items should behave the same as null (start from beginning)");
+    }
+}
+
+/// <summary>
+/// Tests for fix #5 — Options.CacheSize property and validation.
+/// </summary>
+public class CacheSizeOptionsTests
+{
+    [Test]
+    public void CacheSize_DefaultIs4096()
+    {
+        var opts = new RedisStreamOptions();
+        Assert.That(opts.CacheSize, Is.EqualTo(4096));
+    }
+
+    [Test]
+    public void CacheSize_IsSettable()
+    {
+        var opts = new RedisStreamOptions { CacheSize = 1024 };
+        Assert.That(opts.CacheSize, Is.EqualTo(1024));
+    }
+
+    [Test]
+    public void Validate_ZeroCacheSize_Throws()
+    {
+        var opts = new RedisStreamOptions { ConnectionString = "localhost", CacheSize = 0 };
+        Assert.Throws<ArgumentException>(() => opts.Validate());
+    }
+
+    [Test]
+    public void Validate_NegativeCacheSize_Throws()
+    {
+        var opts = new RedisStreamOptions { ConnectionString = "localhost", CacheSize = -1 };
+        Assert.Throws<ArgumentException>(() => opts.Validate());
+    }
+
+    [Test]
+    public void Validate_CustomCacheSize_DoesNotThrow()
+    {
+        var opts = new RedisStreamOptions { ConnectionString = "localhost", CacheSize = 512 };
+        Assert.DoesNotThrow(() => opts.Validate());
+    }
+
+    [Test]
+    public void SimpleQueueAdapterCache_UsesCacheSize()
+    {
+        // Verify the cache is created with the configured size.
+        var cache = new Orleans.Streaming.Redis.Providers.SimpleQueueAdapterCache("test", 256);
+        var queueCache = (RedisQueueCache)cache.CreateQueueCache(QueueId.GetQueueId("test", 0, 0));
+        Assert.That(queueCache.GetMaxAddCount(), Is.EqualTo(256),
+            "Cache should be created with the configured CacheSize");
+    }
+}
+
+/// <summary>
+/// Tests for fix #6 — DeadLetterPrefix option.
+/// </summary>
+public class DeadLetterOptionsTests
+{
+    [Test]
+    public void DeadLetterPrefix_DefaultIsNull()
+    {
+        var opts = new RedisStreamOptions();
+        Assert.That(opts.DeadLetterPrefix, Is.Null);
+    }
+
+    [Test]
+    public void DeadLetterPrefix_IsSettable()
+    {
+        var opts = new RedisStreamOptions { DeadLetterPrefix = "dead:letters" };
+        Assert.That(opts.DeadLetterPrefix, Is.EqualTo("dead:letters"));
+    }
+
+    [Test]
+    public void Validate_WithDeadLetterPrefix_DoesNotThrow()
+    {
+        var opts = new RedisStreamOptions
+        {
+            ConnectionString = "localhost",
+            DeadLetterPrefix = "dl:stream",
+        };
+        Assert.DoesNotThrow(() => opts.Validate());
+    }
+}

@@ -86,6 +86,8 @@ public class MyGrain : Grain, IAsyncObserver<MyEvent>
 | `MaxBatchSize` | `100` | Max messages per `XREADGROUP` poll. |
 | `MaxStreamLength` | `10000` | `MAXLEN` for `XADD`. Caps stream size. `0` = unlimited. |
 | `Database` | `-1` | Redis database index. `-1` = default from connection string. |
+| `CacheSize` | `4096` | In-memory cache capacity (batch containers) per queue partition. |
+| `DeadLetterPrefix` | `null` | Redis key prefix for dead-letter stream. When set, undeserializable messages are forwarded here and XACK'd. `null` = disabled. |
 
 ## Architecture
 
@@ -111,12 +113,18 @@ Each silo runs a pulling agent per queue partition. Messages are distributed acr
 
 ## Status
 
-**v0.1.0 — Alpha.** Core functionality works. Known limitations:
+**v0.1.0 — Alpha.** Core functionality works.
 
-- [ ] `XACK` not yet implemented in `MessagesDeliveredAsync` (relies on consumer group auto-advance)
-- [ ] No pending message recovery (`XPENDING` / `XCLAIM`)
-- [ ] No connection pooling (single `ConnectionMultiplexer` per provider)
-- [ ] Integration tests require running Redis instance
+### v0.2.0 Roadmap
+
+<!-- TODO(v0.2): Optional JSON serialization mode — allow configuring an alternative payload
+     encoding (e.g. System.Text.Json) instead of the default Orleans binary serializer.
+     Useful for interop with non-Orleans consumers that read from the same Redis Streams.
+     Decided out of scope for v0.1 to avoid over-engineering; revisit when there is a
+     concrete use-case. -->
+
+- [ ] Optional JSON payload mode for non-Orleans consumers (v0.2, see TODO above)
+- [ ] Connection pooling / multi-connection support for high-throughput scenarios
 
 Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 

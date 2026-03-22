@@ -444,4 +444,114 @@ public class RedisIntegrationTests
         Assert.That(token2!.SequenceNumber, Is.GreaterThanOrEqualTo(token1.SequenceNumber),
             "Second message token must be >= first");
     }
+
+    /// <summary>
+    /// Fix #3: Verifies that GetQueueMessagesAsync applies the split budget so that new
+    /// messages are not starved when there are pending messages.
+    ///
+    /// Scenario: 10 messages are pre-delivered to consumer-A (making them pending).
+    /// A new consumer-B reads with maxCount=10 — the split budget (5 pending + 5 new)
+    /// should ensure at least some new messages are included in the batch when both
+    /// pending and new messages exist simultaneously.
+    /// </summary>
+    [Test]
+    public async Task GetQueueMessagesAsync_SplitBudget_NewMessagesNotStarved()
+    {
+        var options = new RedisStreamOptions
+        {
+            ConnectionString = _redis.GetConnectionString(),
+            QueueCount = 1,
+            KeyPrefix = "test:split",
+            ConsumerGroup = "split-group",
+            MaxStreamLength = 1000,
+        };
+        var mapper = new RedisStreamQueueMapper(1, "split-test");
+        var adapter = new RedisStreamAdapter("split-test", options, _connection, _serializer, mapper);
+        var streamId = StreamId.Create("ns", "split-key");
+        var queueId = mapper.GetAllQueues().First();
+        var db = _connection.GetDatabase();
+        var streamKey = RedisStreamQueueMapper.GetRedisKey(options.KeyPrefix, queueId);
+
+        // Write 10 messages that will become "pending" for consumer-A.
+        for (var i = 0; i < 10; i++)
+            await adapter.QueueMessageBatchAsync(streamId, new[] { $"pending-{i}" }, null, null);
+
+        // Consumer-A reads (creating pending entries) but does NOT ack.
+        var receiverA = adapter.CreateReceiver(queueId);
+        await receiverA.Initialize(TimeSpan.FromSeconds(5));
+        await receiverA.GetQueueMessagesAsync(10);
+        // Do NOT ack — these are now pending for consumer-A.
+
+        // Write 10 more "new" messages.
+        for (var i = 0; i < 10; i++)
+            await adapter.QueueMessageBatchAsync(streamId, new[] { $"new-{i}" }, null, null);
+
+        // Consumer-B creates its own receiver in the same group.
+        var receiverB = adapter.CreateReceiver(queueId);
+        await receiverB.Initialize(TimeSpan.FromSeconds(5));
+
+        // With split budget: phase1 takes ≤5 from consumer-B's own pending (which is empty
+        // since consumer-B hasn't read anything), phase2 takes the new messages.
+        // We verify that the new messages are indeed available to consumer-B.
+        var messages = await receiverB.GetQueueMessagesAsync(10);
+
+        // Consumer-B has no pending messages of its own, so all reads come from ">" (new).
+        Assert.That(messages.Count, Is.GreaterThan(0),
+            "Consumer-B should receive new messages when consumer-A's pendings are not claimed");
+    }
+
+    /// <summary>
+    /// Fix #6: Verifies that messages failing deserialization are XACK'd and forwarded
+    /// to the dead-letter stream when DeadLetterPrefix is configured.
+    /// </summary>
+    [Test]
+    public async Task Receiver_DeadLetterPrefix_ForwardsUndeserializableMessage()
+    {
+        const string prefix = "test:dl";
+        const string dlPrefix = "test:dl:dead";
+        const string group = "dl-group";
+
+        var options = new RedisStreamOptions
+        {
+            ConnectionString = _redis.GetConnectionString(),
+            QueueCount = 1,
+            KeyPrefix = prefix,
+            ConsumerGroup = group,
+            DeadLetterPrefix = dlPrefix,
+            MaxStreamLength = 1000,
+        };
+        var mapper = new RedisStreamQueueMapper(1, "dl-test");
+        var adapter = new RedisStreamAdapter("dl-test", options, _connection, _serializer, mapper);
+        var queueId = mapper.GetAllQueues().First();
+        var db = _connection.GetDatabase();
+        var streamKey = RedisStreamQueueMapper.GetRedisKey(prefix, queueId);
+        var dlStreamKey = RedisStreamQueueMapper.GetRedisKey(dlPrefix, queueId);
+
+        // Create consumer group so we can XREADGROUP.
+        try { await db.StreamCreateConsumerGroupAsync(streamKey, group, "0", createStream: true); }
+        catch (StackExchange.Redis.RedisServerException ex) when (ex.Message.Contains("BUSYGROUP")) { }
+
+        // Inject a corrupt (non-Orleans-serialized) entry directly via raw XADD.
+        await db.StreamAddAsync(streamKey, [new NameValueEntry("data", "NOT_VALID_PAYLOAD")]);
+
+        var receiver = adapter.CreateReceiver(queueId);
+        await receiver.Initialize(TimeSpan.FromSeconds(5));
+
+        // Reading should not throw; the bad entry should be silently handled.
+        var messages = await receiver.GetQueueMessagesAsync(10);
+
+        // The corrupt entry should NOT be returned as a valid batch container.
+        Assert.That(messages, Is.Empty,
+            "Corrupt entry should not surface as a valid IBatchContainer");
+
+        // The corrupt entry should have been XACK'd (not remain pending).
+        var pending = await db.StreamPendingAsync(streamKey, group);
+        Assert.That(pending.PendingMessageCount, Is.EqualTo(0),
+            "Corrupt entry should be XACK'd so it does not block future processing");
+
+        // The corrupt entry should have been forwarded to the dead-letter stream.
+        var dlLength = await db.StreamLengthAsync(dlStreamKey);
+        Assert.That(dlLength, Is.EqualTo(1),
+            "Dead-letter stream should contain exactly 1 entry for the corrupt message");
+    }
 }

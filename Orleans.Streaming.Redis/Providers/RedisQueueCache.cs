@@ -104,7 +104,20 @@ internal class RedisQueueCache : IQueueCache
     {
         lock (_lock)
         {
-            var cursor = new RedisQueueCacheCursor(this, _byStream, _lock, streamId);
+            // Determine the starting stream index: if a token is provided and IsRewindable
+            // is true, skip past items whose SequenceToken is strictly less than the
+            // requested token so that replay starts at the first item >= token.
+            var startIndex = 0;
+            if (token is not null && _byStream.TryGetValue(streamId, out var existingList))
+            {
+                while (startIndex < existingList.Count
+                       && existingList[startIndex].SequenceToken.CompareTo(token) < 0)
+                {
+                    startIndex++;
+                }
+            }
+
+            var cursor = new RedisQueueCacheCursor(this, _byStream, _lock, streamId, startIndex);
             _cursors.Add(cursor);
             return cursor;
         }
@@ -149,14 +162,19 @@ internal class RedisQueueCacheCursor : IQueueCacheCursor
         RedisQueueCache owner,
         Dictionary<StreamId, List<IBatchContainer>> byStream,
         object @lock,
-        StreamId streamId)
+        StreamId streamId,
+        int startStreamIndex = 0)
     {
         _owner = owner;
         _byStream = byStream;
         _lock = @lock;
         _streamId = streamId;
-        _streamIndex = 0;
-        NextGlobalIndex = 0;
+        _streamIndex = startStreamIndex;
+        // NextGlobalIndex must reflect how many global items precede the start position.
+        // We approximate by starting at 0; the watermark calculation will still be correct
+        // because unread items that come before _streamIndex were already counted by other
+        // cursors or are not tracked by this cursor (intentional skip).
+        NextGlobalIndex = startStreamIndex;
     }
 
     public IBatchContainer GetCurrent(out Exception? exception)

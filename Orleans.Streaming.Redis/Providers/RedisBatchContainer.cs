@@ -24,6 +24,13 @@ public class RedisBatchContainer : IBatchContainer
     /// </summary>
     [Id(4)] public string? RedisEntryId { get; init; }
 
+    /// <summary>
+    /// Initialises a new <see cref="RedisBatchContainer"/>.
+    /// </summary>
+    /// <param name="streamId">The stream identity these events belong to.</param>
+    /// <param name="events">Deserialised event objects from the Redis entry.</param>
+    /// <param name="requestContext">Optional Orleans request context key-value pairs.</param>
+    /// <param name="sequenceToken">Monotonically increasing token derived from the Redis entry ID.</param>
     public RedisBatchContainer(
         StreamId streamId,
         List<object> events,
@@ -36,9 +43,13 @@ public class RedisBatchContainer : IBatchContainer
         _sequenceToken = sequenceToken;
     }
 
+    /// <inheritdoc />
     public StreamId StreamId => _streamId;
+
+    /// <inheritdoc />
     public StreamSequenceToken SequenceToken => _sequenceToken;
 
+    /// <inheritdoc />
     public IEnumerable<Tuple<T, StreamSequenceToken>> GetEvents<T>()
     {
         return _events
@@ -46,6 +57,7 @@ public class RedisBatchContainer : IBatchContainer
             .Select((e, i) => Tuple.Create(e, (StreamSequenceToken)_sequenceToken.CreateSequenceTokenForEvent(i)));
     }
 
+    /// <inheritdoc />
     public bool ImportRequestContext()
     {
         if (_requestContext is null)

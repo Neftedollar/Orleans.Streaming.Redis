@@ -19,6 +19,15 @@ public class RedisStreamAdapter : IQueueAdapter
     private readonly RedisStreamQueueMapper _queueMapper;
     private readonly ILoggerFactory? _loggerFactory;
 
+    /// <summary>
+    /// Initialises the adapter.
+    /// </summary>
+    /// <param name="providerName">Stream provider name.</param>
+    /// <param name="options">Redis stream configuration options.</param>
+    /// <param name="redis">Active Redis connection multiplexer.</param>
+    /// <param name="serializer">Orleans serializer for payload serialization/deserialization.</param>
+    /// <param name="queueMapper">Maps stream IDs to queue partition IDs.</param>
+    /// <param name="loggerFactory">Optional logger factory.</param>
     public RedisStreamAdapter(
         string providerName,
         RedisStreamOptions options,
@@ -35,14 +44,28 @@ public class RedisStreamAdapter : IQueueAdapter
         _loggerFactory = loggerFactory;
     }
 
+    /// <inheritdoc />
     public string Name { get; }
+
+    /// <inheritdoc />
     public bool IsRewindable => true;
+
+    /// <inheritdoc />
     public StreamProviderDirection Direction => StreamProviderDirection.ReadWrite;
 
+    /// <summary>
+    /// Creates a receiver for the specified queue partition.
+    /// If <see cref="RedisStreamOptions.DeadLetterPrefix"/> is configured, the receiver
+    /// will forward undeserializable messages to the dead-letter stream.
+    /// </summary>
     public IQueueAdapterReceiver CreateReceiver(QueueId queueId)
     {
         var db = _redis.GetDatabase(_options.Database);
         var streamKey = RedisStreamQueueMapper.GetRedisKey(_options.KeyPrefix, queueId);
+
+        string? deadLetterKey = null;
+        if (_options.DeadLetterPrefix is not null)
+            deadLetterKey = RedisStreamQueueMapper.GetRedisKey(_options.DeadLetterPrefix, queueId);
 
         return new RedisStreamReceiver(
             streamKey,
@@ -50,7 +73,8 @@ public class RedisStreamAdapter : IQueueAdapter
             _options.MaxBatchSize,
             db,
             _serializer,
-            _loggerFactory?.CreateLogger<RedisStreamReceiver>());
+            _loggerFactory?.CreateLogger<RedisStreamReceiver>(),
+            deadLetterStreamKey: deadLetterKey);
     }
 
     /// <summary>

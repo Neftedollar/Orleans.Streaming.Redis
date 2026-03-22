@@ -30,15 +30,30 @@ public class RedisStreamReceiver : IQueueAdapterReceiver
     private readonly IDatabase _db;
     private readonly Serializer _serializer;
     private readonly ILogger? _logger;
+    private readonly string? _deadLetterStreamKey;
     private string _consumerId = string.Empty;
 
+    /// <summary>
+    /// Initialises a new <see cref="RedisStreamReceiver"/>.
+    /// </summary>
+    /// <param name="streamKey">Redis Stream key for this queue partition.</param>
+    /// <param name="consumerGroup">Redis consumer group name.</param>
+    /// <param name="maxBatchSize">Maximum number of messages per poll cycle.</param>
+    /// <param name="db">Redis database handle.</param>
+    /// <param name="serializer">Orleans serializer for payload deserialization.</param>
+    /// <param name="logger">Optional logger.</param>
+    /// <param name="deadLetterStreamKey">
+    /// Optional Redis Stream key for dead-letter entries. When non-null, messages
+    /// that fail deserialization are forwarded here and XACK'd from the main stream.
+    /// </param>
     public RedisStreamReceiver(
         string streamKey,
         string consumerGroup,
         int maxBatchSize,
         IDatabase db,
         Serializer serializer,
-        ILogger? logger = null)
+        ILogger? logger = null,
+        string? deadLetterStreamKey = null)
     {
         _streamKey = streamKey;
         _consumerGroup = consumerGroup;
@@ -46,6 +61,7 @@ public class RedisStreamReceiver : IQueueAdapterReceiver
         _db = db;
         _serializer = serializer;
         _logger = logger;
+        _deadLetterStreamKey = deadLetterStreamKey;
     }
 
     /// <inheritdoc />
@@ -142,11 +158,14 @@ public class RedisStreamReceiver : IQueueAdapterReceiver
     }
 
     /// <summary>
-    /// Fix #3: Two-phase read:
-    /// 1. XREADGROUP "0" — read pending entries already assigned to this consumer
-    ///    (e.g. messages claimed from a crashed peer via ClaimOrphanedPendingMessagesAsync).
-    /// 2. XREADGROUP ">" — read new entries not yet delivered to any consumer.
-    /// Both results are combined in a single batch.
+    /// Two-phase read with split budget to prevent pending-message starvation:
+    /// <list type="number">
+    ///   <item><description>XREADGROUP "0" — read pending entries already assigned to this consumer
+    ///   (e.g. messages claimed from a crashed peer via ClaimOrphanedPendingMessagesAsync).
+    ///   Budget: min(count/2, pendingCount) so new messages are never starved.</description></item>
+    ///   <item><description>XREADGROUP ">" — read new entries not yet delivered to any consumer.
+    ///   Budget: remaining after phase 1.</description></item>
+    /// </list>
     /// </summary>
     public async Task<IList<IBatchContainer>> GetQueueMessagesAsync(int maxCount)
     {
@@ -154,15 +173,16 @@ public class RedisStreamReceiver : IQueueAdapterReceiver
         var result = new List<IBatchContainer>();
 
         // Phase 1: read pending entries for this consumer (position "0").
-        // These are messages that were claimed but not yet ACKed — e.g. claimed from a
-        // dead peer. XREADGROUP ">" would skip them; "0" returns them.
+        // Budget is capped at half of total count to prevent pending messages from
+        // starving new messages when the pending queue is large.
+        var phase1Budget = Math.Max(1, count / 2);
         StreamEntry[]? pendingEntries = null;
         try
         {
             pendingEntries = await _db.StreamReadGroupAsync(
                 _streamKey, _consumerGroup, _consumerId,
                 position: "0",
-                count: count);
+                count: phase1Budget);
         }
         catch (RedisException ex)
         {
@@ -171,10 +191,10 @@ public class RedisStreamReceiver : IQueueAdapterReceiver
         }
 
         // Phase 2: read new (undelivered) entries (position ">").
+        // Gets the remaining budget after phase 1.
         StreamEntry[]? newEntries = null;
         try
         {
-            // Reduce count by how many pending we got so we don't exceed maxCount total.
             var pendingCount = pendingEntries?.Length ?? 0;
             var remaining = Math.Max(1, count - pendingCount);
 
@@ -230,9 +250,47 @@ public class RedisStreamReceiver : IQueueAdapterReceiver
             catch (Exception ex)
             {
                 RedisStreamMetrics.MessagesFailed.Add(1);
-                _logger?.LogWarning(ex,
-                    "RedisStreamReceiver: failed to deserialize entry {EntryId} from {StreamKey}",
+                _logger?.LogError(ex,
+                    "RedisStreamReceiver: failed to deserialize entry {EntryId} from {StreamKey}. " +
+                    "Entry will be XACK'd to prevent redelivery loop.",
                     entry.Id, _streamKey);
+
+                // XACK the bad entry so it does not remain in the pending list and block
+                // future processing. A deserialization failure is not recoverable by retry.
+                try
+                {
+                    await _db.StreamAcknowledgeAsync(_streamKey, _consumerGroup, entry.Id);
+                }
+                catch (Exception ackEx)
+                {
+                    _logger?.LogWarning(ackEx,
+                        "RedisStreamReceiver: XACK of failed entry {EntryId} on {StreamKey} failed",
+                        entry.Id, _streamKey);
+                }
+
+                // Forward to dead-letter stream if configured.
+                if (_deadLetterStreamKey is not null)
+                {
+                    try
+                    {
+                        var dlData = entry["data"];
+                        var rawPayload = dlData.IsNull ? RedisValue.EmptyString : dlData;
+                        await _db.StreamAddAsync(
+                            _deadLetterStreamKey,
+                            [
+                                new NameValueEntry("source_stream", _streamKey),
+                                new NameValueEntry("source_id", entry.Id.ToString()),
+                                new NameValueEntry("error", ex.Message),
+                                new NameValueEntry("data", rawPayload),
+                            ]);
+                    }
+                    catch (Exception dlEx)
+                    {
+                        _logger?.LogWarning(dlEx,
+                            "RedisStreamReceiver: failed to write dead-letter entry {EntryId} to {DeadLetterKey}",
+                            entry.Id, _deadLetterStreamKey);
+                    }
+                }
             }
         }
 
