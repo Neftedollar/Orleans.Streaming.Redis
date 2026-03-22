@@ -79,11 +79,18 @@ public class RedisStreamAdapter : IQueueAdapter
         IEnumerable<T> events,
         Dictionary<string, object>? requestContext)
     {
+        // Serialize each event individually with full type info so that
+        // deserialization on a different silo can reconstruct the concrete type.
+        var eventPayloads = events
+            .Cast<object>()
+            .Select(e => _serializer.SerializeToArray(e))
+            .ToList();
+
         var container = new RedisStreamPayload(
             StreamIdString: streamId.ToString(),
             StreamNamespace: streamId.GetNamespace(),
             StreamKey: streamId.GetKeyAsString(),
-            Events: events.Cast<object>().ToList(),
+            EventPayloads: eventPayloads,
             RequestContext: requestContext);
 
         return _serializer.SerializeToArray(container);
@@ -92,11 +99,13 @@ public class RedisStreamAdapter : IQueueAdapter
 
 /// <summary>
 /// Serializable payload stored in each Redis Stream entry.
+/// Each event is pre-serialized as a byte[] envelope that carries full Orleans type info,
+/// enabling correct round-trip deserialization across silo boundaries.
 /// </summary>
 [GenerateSerializer]
 internal record RedisStreamPayload(
     [property: Id(0)] string StreamIdString,
     [property: Id(1)] string? StreamNamespace,
     [property: Id(2)] string StreamKey,
-    [property: Id(3)] List<object> Events,
+    [property: Id(3)] List<byte[]> EventPayloads,
     [property: Id(4)] Dictionary<string, object>? RequestContext);

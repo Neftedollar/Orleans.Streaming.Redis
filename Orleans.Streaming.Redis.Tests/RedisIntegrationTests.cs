@@ -10,6 +10,16 @@ using Testcontainers.Redis;
 namespace Orleans.Streaming.Redis.Tests;
 
 /// <summary>
+/// Custom domain event used to verify cross-silo serialization roundtrip.
+/// Must have [GenerateSerializer] so Orleans can encode/decode it with full type info.
+/// </summary>
+[GenerateSerializer]
+public record OrderPlacedEvent(
+    [property: Id(0)] string OrderId,
+    [property: Id(1)] decimal Amount,
+    [property: Id(2)] DateTimeOffset PlacedAt);
+
+/// <summary>
 /// Integration tests against a real Redis instance via Testcontainers.
 /// Tests the full XADD → XREADGROUP → XACK cycle.
 /// </summary>
@@ -233,5 +243,98 @@ public class RedisIntegrationTests
         // Consumer group guarantees: each message delivered to exactly one consumer
         Assert.That(msgs1.Count + msgs2.Count, Is.EqualTo(10),
             "Total messages across consumers should equal produced messages");
+    }
+
+    /// <summary>
+    /// Verifies that custom domain types survive the full XADD → XREADGROUP serialization
+    /// roundtrip with correct type identity. This covers the fix where List&lt;object&gt; was
+    /// replaced with List&lt;byte[]&gt; in RedisStreamPayload so that Orleans type envelopes
+    /// are preserved across silo boundaries.
+    /// </summary>
+    [Test]
+    public async Task Adapter_CustomType_SerializationRoundtrip()
+    {
+        var options = new RedisStreamOptions
+        {
+            ConnectionString = _redis.GetConnectionString(),
+            QueueCount = 1,
+            KeyPrefix = "test:customtype",
+            MaxStreamLength = 1000,
+        };
+        var mapper = new RedisStreamQueueMapper(1, "customtype-test");
+        var adapter = new RedisStreamAdapter("customtype-test", options, _connection, _serializer, mapper);
+
+        var streamId = StreamId.Create("orders", "stream1");
+        var sent = new OrderPlacedEvent("ORD-42", 99.95m, new DateTimeOffset(2026, 3, 22, 12, 0, 0, TimeSpan.Zero));
+
+        // Produce
+        await adapter.QueueMessageBatchAsync(streamId, new[] { sent }, null, null);
+
+        // Consume
+        var queueId = mapper.GetAllQueues().First();
+        var receiver = adapter.CreateReceiver(queueId);
+        await receiver.Initialize(TimeSpan.FromSeconds(5));
+
+        var messages = await receiver.GetQueueMessagesAsync(10);
+
+        Assert.That(messages, Has.Count.EqualTo(1));
+        var container = (RedisBatchContainer)messages[0];
+        Assert.That(container.StreamId, Is.EqualTo(streamId));
+
+        var events = container.GetEvents<OrderPlacedEvent>().ToList();
+        Assert.That(events, Has.Count.EqualTo(1), "Custom type event should be deserialized");
+
+        var received = events[0].Item1;
+        Assert.That(received.OrderId, Is.EqualTo(sent.OrderId));
+        Assert.That(received.Amount, Is.EqualTo(sent.Amount));
+        Assert.That(received.PlacedAt, Is.EqualTo(sent.PlacedAt));
+    }
+
+    /// <summary>
+    /// Verifies that the sequence token is derived from the Redis entry ID, giving a
+    /// monotonically increasing value based on the Redis server timestamp rather than
+    /// a simple counter that resets on silo restart.
+    /// </summary>
+    [Test]
+    public async Task Receiver_SequenceToken_DerivedFromRedisEntryId()
+    {
+        var options = new RedisStreamOptions
+        {
+            ConnectionString = _redis.GetConnectionString(),
+            QueueCount = 1,
+            KeyPrefix = "test:seqtoken",
+            MaxStreamLength = 1000,
+        };
+        var mapper = new RedisStreamQueueMapper(1, "seqtoken-test");
+        var adapter = new RedisStreamAdapter("seqtoken-test", options, _connection, _serializer, mapper);
+
+        var streamId = StreamId.Create("ns", "seqkey");
+
+        // Write two messages so we can verify ordering.
+        await adapter.QueueMessageBatchAsync(streamId, new[] { "first" }, null, null);
+        await adapter.QueueMessageBatchAsync(streamId, new[] { "second" }, null, null);
+
+        var queueId = mapper.GetAllQueues().First();
+        var receiver = adapter.CreateReceiver(queueId);
+        await receiver.Initialize(TimeSpan.FromSeconds(5));
+
+        var messages = await receiver.GetQueueMessagesAsync(10);
+
+        Assert.That(messages, Has.Count.EqualTo(2));
+
+        var token1 = messages[0].SequenceToken as EventSequenceTokenV2;
+        var token2 = messages[1].SequenceToken as EventSequenceTokenV2;
+
+        Assert.That(token1, Is.Not.Null, "Sequence token must be EventSequenceTokenV2");
+        Assert.That(token2, Is.Not.Null);
+
+        // Token should be based on Redis timestamp (milliseconds since epoch), not a plain counter.
+        // A Redis timestamp is always >> 0 and >> a simple counter starting at 0.
+        Assert.That(token1!.SequenceNumber, Is.GreaterThan(0),
+            "Sequence number should be the Redis entry timestamp, not a plain 0-based counter");
+
+        // Second message must sort after the first.
+        Assert.That(token2!.SequenceNumber, Is.GreaterThanOrEqualTo(token1.SequenceNumber),
+            "Second message token must be >= first");
     }
 }

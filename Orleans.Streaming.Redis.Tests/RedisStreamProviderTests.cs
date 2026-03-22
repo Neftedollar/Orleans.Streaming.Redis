@@ -1,3 +1,4 @@
+using Orleans.Providers.Streams.Common;
 using Orleans.Streams;
 using Orleans.Streaming.Redis.Configuration;
 using Orleans.Streaming.Redis.Providers;
@@ -194,5 +195,149 @@ public class RedisBatchContainerTests
         var container = new RedisBatchContainer(streamId, [], ctx, token);
 
         Assert.That(container.ImportRequestContext(), Is.True);
+    }
+}
+
+/// <summary>
+/// Unit tests for RedisQueueCache purge behaviour.
+/// </summary>
+public class RedisQueueCacheTests
+{
+    private static RedisBatchContainer MakeContainer(string ns, string key, long seq)
+    {
+        var streamId = StreamId.Create(ns, key);
+        var token = new EventSequenceTokenV2(seq);
+        return new RedisBatchContainer(streamId, [$"event-{seq}"], null, token);
+    }
+
+    [Test]
+    public void TryPurgeFromCache_NoCursors_PurgesAll()
+    {
+        var cache = new RedisQueueCache(128);
+        var msgs = new List<IBatchContainer>
+        {
+            MakeContainer("ns", "k", 1),
+            MakeContainer("ns", "k", 2),
+            MakeContainer("ns", "k", 3),
+        };
+        cache.AddToCache(msgs);
+
+        var purged = cache.TryPurgeFromCache(out var items);
+
+        Assert.That(purged, Is.True);
+        Assert.That(items, Has.Count.EqualTo(3));
+        // After purge the cache should be empty — no cursor to block
+        Assert.That(cache.GetMaxAddCount(), Is.EqualTo(128));
+    }
+
+    [Test]
+    public void TryPurgeFromCache_CursorNotAdvanced_PurgesNothing()
+    {
+        var cache = new RedisQueueCache(128);
+        var streamId = StreamId.Create("ns", "k");
+        cache.AddToCache(new List<IBatchContainer>
+        {
+            MakeContainer("ns", "k", 1),
+            MakeContainer("ns", "k", 2),
+        });
+
+        // Obtain a cursor but don't advance it.
+        using var cursor = cache.GetCacheCursor(streamId, null);
+
+        var purged = cache.TryPurgeFromCache(out var items);
+
+        Assert.That(purged, Is.False, "Nothing should be purged when cursor is at position 0");
+        Assert.That(items, Is.Null);
+    }
+
+    [Test]
+    public void TryPurgeFromCache_CursorFullyAdvanced_PurgesAll()
+    {
+        var cache = new RedisQueueCache(128);
+        var streamId = StreamId.Create("ns", "k");
+        cache.AddToCache(new List<IBatchContainer>
+        {
+            MakeContainer("ns", "k", 1),
+            MakeContainer("ns", "k", 2),
+            MakeContainer("ns", "k", 3),
+        });
+
+        using var cursor = cache.GetCacheCursor(streamId, null);
+        // Advance past all items.
+        while (cursor.MoveNext()) { }
+
+        var purged = cache.TryPurgeFromCache(out var items);
+
+        Assert.That(purged, Is.True);
+        Assert.That(items, Has.Count.EqualTo(3));
+    }
+
+    [Test]
+    public void TryPurgeFromCache_CursorPartiallyAdvanced_PurgesOnlyConsumed()
+    {
+        var cache = new RedisQueueCache(128);
+        var streamId = StreamId.Create("ns", "k");
+        cache.AddToCache(new List<IBatchContainer>
+        {
+            MakeContainer("ns", "k", 1),
+            MakeContainer("ns", "k", 2),
+            MakeContainer("ns", "k", 3),
+        });
+
+        using var cursor = cache.GetCacheCursor(streamId, null);
+        // Advance past the first item only.
+        cursor.MoveNext();
+
+        var purged = cache.TryPurgeFromCache(out var items);
+
+        Assert.That(purged, Is.True);
+        Assert.That(items, Has.Count.EqualTo(1), "Only the item the cursor advanced past should be purged");
+    }
+
+    [Test]
+    public void TryPurgeFromCache_DisposedCursor_DoesNotBlockPurge()
+    {
+        var cache = new RedisQueueCache(128);
+        var streamId = StreamId.Create("ns", "k");
+        cache.AddToCache(new List<IBatchContainer>
+        {
+            MakeContainer("ns", "k", 1),
+            MakeContainer("ns", "k", 2),
+        });
+
+        // Create, advance partially, then dispose the cursor.
+        var cursor = cache.GetCacheCursor(streamId, null);
+        cursor.MoveNext();
+        cursor.Dispose(); // removed from _cursors
+
+        // With no active cursors, everything should purge.
+        var purged = cache.TryPurgeFromCache(out var items);
+
+        Assert.That(purged, Is.True);
+        Assert.That(items, Has.Count.EqualTo(2));
+    }
+
+    [Test]
+    public void TryPurgeFromCache_EmptyCache_ReturnsFalse()
+    {
+        var cache = new RedisQueueCache(128);
+
+        var purged = cache.TryPurgeFromCache(out var items);
+
+        Assert.That(purged, Is.False);
+        Assert.That(items, Is.Null);
+    }
+
+    [Test]
+    public void IsUnderPressure_TrueWhenAtMaxSize()
+    {
+        var cache = new RedisQueueCache(2);
+        cache.AddToCache(new List<IBatchContainer>
+        {
+            MakeContainer("ns", "k", 1),
+            MakeContainer("ns", "k", 2),
+        });
+
+        Assert.That(cache.IsUnderPressure(), Is.True);
     }
 }
