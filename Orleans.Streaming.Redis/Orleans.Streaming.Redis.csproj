@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFrameworks>net8.0;net9.0;net10.0</TargetFrameworks>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+
+    <!-- NuGet package metadata -->
+    <PackageId>Orleans.Streaming.Redis</PackageId>
+    <Version>0.1.0</Version>
+    <Authors>AISwarm</Authors>
+    <Description>Redis Streams persistent stream provider for Microsoft Orleans 10.x. Uses Redis Streams (XADD/XREAD/XACK) as a durable, cross-silo message transport.</Description>
+    <PackageTags>orleans;streaming;redis;distributed;actors</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <RepositoryUrl>https://github.com/Neftedollar/Orleans.Streaming.Redis</RepositoryUrl>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Orleans.Streaming" Version="10.0.1" />
+    <PackageReference Include="StackExchange.Redis" Version="2.8.41" />
+  </ItemGroup>
+
+</Project>

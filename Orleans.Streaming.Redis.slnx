@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="Orleans.Streaming.Redis.Tests/Orleans.Streaming.Redis.Tests.csproj" />
+  <Project Path="Orleans.Streaming.Redis/Orleans.Streaming.Redis.csproj" />
+</Solution>
