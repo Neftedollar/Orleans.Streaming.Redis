@@ -58,7 +58,8 @@ builder.Host.UseOrleans(silo =>
 
 ```csharp
 var streamProvider = clusterClient.GetStreamProvider("StreamProvider");
-var stream = streamProvider.GetStream<MyEvent>("my-namespace", "my-key");
+var streamId = StreamId.Create("my-namespace", "my-key");
+var stream = streamProvider.GetStream<MyEvent>(streamId);
 await stream.OnNextAsync(new MyEvent { ... });
 ```
 
@@ -71,7 +72,8 @@ public class MyGrain : Grain, IAsyncObserver<MyEvent>
     public override async Task OnActivateAsync(CancellationToken ct)
     {
         var provider = this.GetStreamProvider("StreamProvider");
-        var stream = provider.GetStream<MyEvent>("my-namespace", this.GetPrimaryKeyString());
+        var streamId = StreamId.Create("my-namespace", this.GetPrimaryKeyString());
+        var stream = provider.GetStream<MyEvent>(streamId);
         await stream.SubscribeAsync(this);
     }
 
@@ -119,18 +121,11 @@ Each silo runs a pulling agent per queue partition. Messages are distributed acr
 
 ## Status
 
-**v0.1.0 — Alpha.** Core functionality works.
+**v1.0.0** — Core functionality works, cross-silo delivery, consumer groups, crash recovery, dead-letter support.
 
-### v0.2.0 Roadmap
+### Roadmap
 
-<!-- TODO(v0.2): Optional JSON serialization mode — allow configuring an alternative payload
-     encoding (e.g. System.Text.Json) instead of the default Orleans binary serializer.
-     Useful for interop with non-Orleans consumers that read from the same Redis Streams.
-     Decided out of scope for v0.1 to avoid over-engineering; revisit when there is a
-     concrete use-case. -->
-
-- [ ] Optional JSON payload mode for non-Orleans consumers (v0.2, see TODO above)
-- [ ] Connection pooling / multi-connection support for high-throughput scenarios
+- [ ] Optional JSON payload mode for non-Orleans consumers (interop with Node.js, Python, Go, etc.)
 
 ## Documentation
 
