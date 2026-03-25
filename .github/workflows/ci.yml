@@ -65,9 +65,9 @@ jobs:
 
       - name: Upload coverage to Codecov
         if: success()
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v5
         with:
-          files: ./TestResults/**/coverage.cobertura.xml
+          files: ./TestResults/CoverageReport/Cobertura.xml,./TestResults/**/coverage.cobertura.xml
           fail_ci_if_error: false
           token: ${{ secrets.CODECOV_TOKEN }}
 
