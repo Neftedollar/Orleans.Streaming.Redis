@@ -132,6 +132,10 @@ Orleans.Streaming.Redis implements the [Orleans persistent stream provider](http
 
 ## Serialization
 
+The provider supports two serialization modes, controlled by `RedisStreamOptions.PayloadMode`:
+
+### Binary mode (default)
+
 Events are serialized using Orleans' binary serializer (`Orleans.Serialization.Serializer`), which embeds full type information in each `byte[]` envelope. This means:
 
 - Any `[GenerateSerializer]` type is correctly reconstructed on any silo
@@ -143,6 +147,33 @@ The serialization is two-level:
 2. **Payload level:** `RedisStreamPayload { StreamId, List<byte[]>, RequestContext }` → `byte[]`
 
 The outer payload is what gets stored as the `data` field in the Redis Stream entry.
+
+### JSON mode
+
+Events are serialized using `System.Text.Json` into human-readable multi-field Redis entries:
+
+```
+XADD orleans:stream:3 MAXLEN ~ 10000 *
+    _payload_mode   "json"
+    stream_namespace "orders"
+    stream_key      "ORD-42"
+    payload         "[{\"orderId\":\"ORD-42\",\"amount\":99.95}]"
+    request_context "{\"traceId\":\"abc123\"}"
+```
+
+Key differences from Binary mode:
+- Events are serialized with their runtime type via `JsonSerializer.Serialize(event, event.GetType())`
+- Type information is **not** embedded — the consumer must know the expected type `T`
+- Events are deserialized lazily in `RedisBatchContainer.GetEvents<T>()` via `JsonElement.Deserialize<T>()`
+- Entries are directly readable by non-Orleans consumers (Node.js, Python, Go, etc.)
+
+### Auto-detection on read
+
+The receiver auto-detects the payload format for each entry:
+- If the entry contains a `_payload_mode` field with value `"json"` → JSON deserialization
+- Otherwise, if the entry contains a `data` field → Binary deserialization (existing path)
+
+This enables **zero-downtime migration** from Binary to JSON mode during rolling deployments.
 
 ## Metrics
 

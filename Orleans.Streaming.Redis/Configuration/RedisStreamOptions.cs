@@ -1,3 +1,5 @@
+using System.Text.Json;
+
 namespace Orleans.Streaming.Redis.Configuration;
 
 /// <summary>
@@ -55,6 +57,23 @@ public class RedisStreamOptions
     /// Default: 4096.
     /// </summary>
     public int CacheSize { get; set; } = 4096;
+
+    /// <summary>
+    /// Controls how events are serialized when written to Redis Streams.
+    /// <see cref="RedisStreamPayloadMode.Binary"/> (default) uses Orleans binary serialization.
+    /// <see cref="RedisStreamPayloadMode.Json"/> writes human-readable JSON, enabling
+    /// interop with non-Orleans consumers.
+    /// The read path auto-detects the format, so mixed Binary/Json entries are handled
+    /// transparently during rolling deployments.
+    /// </summary>
+    public RedisStreamPayloadMode PayloadMode { get; set; } = RedisStreamPayloadMode.Binary;
+
+    /// <summary>
+    /// Custom <see cref="JsonSerializerOptions"/> used when <see cref="PayloadMode"/> is
+    /// <see cref="RedisStreamPayloadMode.Json"/>. When <see langword="null"/>, sensible
+    /// defaults are used (camelCase, no indentation, ignore null values).
+    /// </summary>
+    public JsonSerializerOptions? JsonSerializerOptions { get; set; }
 
     /// <summary>
     /// Key prefix for the dead-letter stream. When set, messages that fail deserialization

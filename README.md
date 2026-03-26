@@ -26,6 +26,7 @@ This package fills the gap: a lightweight Redis Streams adapter that works with 
 - **Partitioned queues** — configurable number of stream partitions for parallelism
 - **Bounded retention** — `MAXLEN` on `XADD` prevents unbounded stream growth
 - **Multi-target** — supports `net8.0`, `net9.0`, `net10.0`
+- **JSON payload mode** — optional human-readable JSON encoding for interop with non-Orleans consumers
 - **Minimal dependencies** — only `Microsoft.Orleans.Streaming` + `StackExchange.Redis`
 
 ## Quick Start
@@ -95,6 +96,8 @@ public class MyGrain : Grain, IAsyncObserver<MyEvent>
 | `MaxStreamLength` | `10000` | `MAXLEN` for `XADD`. Caps stream size. `0` = unlimited. |
 | `Database` | `-1` | Redis database index. `-1` = default from connection string. |
 | `CacheSize` | `4096` | In-memory cache capacity (batch containers) per queue partition. |
+| `PayloadMode` | `Binary` | `Binary` (Orleans binary, default) or `Json` (human-readable, for interop with non-Orleans consumers). |
+| `JsonSerializerOptions` | `null` | Custom `System.Text.Json.JsonSerializerOptions` for JSON mode. `null` = camelCase, no indentation. |
 | `DeadLetterPrefix` | `null` | Redis key prefix for dead-letter stream. When set, undeserializable messages are forwarded here and XACK'd. `null` = disabled. |
 
 ## Architecture
@@ -113,6 +116,33 @@ Orleans PullingAgent → IQueueCache → Subscriber Grain.OnNextAsync()
 
 Each silo runs a pulling agent per queue partition. Messages are distributed across partitions via consistent hashing on `StreamId`.
 
+## JSON Payload Mode
+
+By default, events are serialized using Orleans binary format (compact but opaque). Enable JSON mode to write human-readable entries that non-Orleans consumers can read directly:
+
+```csharp
+silo.AddRedisStreams("StreamProvider", options =>
+{
+    options.ConnectionString = "localhost:6379";
+    options.PayloadMode = RedisStreamPayloadMode.Json;
+});
+```
+
+JSON-mode entries in Redis look like this:
+
+```
+> XRANGE orleans:stream:0 - + COUNT 1
+1) 1) "1679000000000-0"
+   2) 1) "_payload_mode"  2) "json"
+      3) "stream_namespace"  4) "orders"
+      5) "stream_key"  6) "ORD-42"
+      7) "payload"  8) "[{\"orderId\":\"ORD-42\",\"amount\":99.95}]"
+```
+
+Reading from Node.js, Python, or Go is straightforward — just `XREADGROUP` and parse the `payload` field as JSON.
+
+The **read path auto-detects** the format (Binary vs JSON) via a discriminator field, so mixed entries are handled transparently during rolling deployments from Binary to JSON mode.
+
 ## Redis Requirements
 
 - **Redis 5.0+** (Streams support)
@@ -121,11 +151,15 @@ Each silo runs a pulling agent per queue partition. Messages are distributed acr
 
 ## Status
 
-**v1.0.0** — Core functionality works, cross-silo delivery, consumer groups, crash recovery, dead-letter support.
+**v1.1.0** — Core functionality, cross-silo delivery, consumer groups, crash recovery, dead-letter support, JSON payload mode.
 
-### Roadmap
+### Changelog
 
-- [ ] Optional JSON payload mode for non-Orleans consumers (interop with Node.js, Python, Go, etc.)
+- [x] Cross-silo delivery via Redis Streams
+- [x] Consumer groups with automatic offset tracking
+- [x] Crash recovery via XPENDING + XCLAIM
+- [x] Dead-letter stream support
+- [x] Optional JSON payload mode for non-Orleans consumers (v1.1.0)
 
 ## Documentation
 

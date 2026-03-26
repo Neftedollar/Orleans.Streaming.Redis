@@ -74,7 +74,8 @@ public class RedisStreamAdapter : IQueueAdapter
             db,
             _serializer,
             _loggerFactory?.CreateLogger<RedisStreamReceiver>(),
-            deadLetterStreamKey: deadLetterKey);
+            deadLetterStreamKey: deadLetterKey,
+            jsonSerializerOptions: _options.JsonSerializerOptions ?? JsonPayloadSerializer.DefaultOptions);
     }
 
     /// <summary>
@@ -91,7 +92,10 @@ public class RedisStreamAdapter : IQueueAdapter
         var streamKey = RedisStreamQueueMapper.GetRedisKey(_options.KeyPrefix, queueId);
         var db = _redis.GetDatabase(_options.Database);
 
-        var payload = SerializeBatch(streamId, events, requestContext);
+        var entries = _options.PayloadMode == Configuration.RedisStreamPayloadMode.Json
+            ? JsonPayloadSerializer.Serialize(streamId, events, requestContext,
+                _options.JsonSerializerOptions ?? JsonPayloadSerializer.DefaultOptions)
+            : [new NameValueEntry("data", SerializeBatch(streamId, events, requestContext))];
 
         var maxLen = _options.MaxStreamLength > 0 ? _options.MaxStreamLength : (int?)null;
 
@@ -105,7 +109,7 @@ public class RedisStreamAdapter : IQueueAdapter
             {
                 await db.StreamAddAsync(
                     streamKey,
-                    [new NameValueEntry("data", payload)],
+                    entries,
                     maxLength: maxLen,
                     useApproximateMaxLength: true);
 

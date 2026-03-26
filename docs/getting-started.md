@@ -45,7 +45,7 @@ public class ProducerGrain : Grain, IProducerGrain
     public async Task PublishOrderAsync(string orderId, decimal amount)
     {
         var provider = this.GetStreamProvider("StreamProvider");
-        var stream = provider.GetStream<OrderEvent>("orders", orderId);
+        var stream = provider.GetStream<OrderEvent>(StreamId.Create("orders", orderId));
 
         await stream.OnNextAsync(new OrderEvent(orderId, amount, DateTimeOffset.UtcNow));
     }
@@ -67,7 +67,7 @@ public class OrderProcessorGrain : Grain, IOrderProcessorGrain, IAsyncObserver<O
     public override async Task OnActivateAsync(CancellationToken ct)
     {
         var provider = this.GetStreamProvider("StreamProvider");
-        var stream = provider.GetStream<OrderEvent>("orders", this.GetPrimaryKeyString());
+        var stream = provider.GetStream<OrderEvent>(StreamId.Create("orders", this.GetPrimaryKeyString()));
         await stream.SubscribeAsync(this);
     }
 
@@ -100,6 +100,45 @@ dotnet run
 3. Orleans PullingAgent periodically calls `XREADGROUP` to fetch new messages
 4. The message is deserialized and delivered to `OrderProcessorGrain.OnNextAsync`
 5. After delivery, `XACK` acknowledges the message in the consumer group
+
+## Interop with Non-Orleans Consumers
+
+If you need external services (Node.js, Python, Go) to read from the same Redis Streams, enable JSON payload mode:
+
+```csharp
+silo.AddRedisStreams("StreamProvider", options =>
+{
+    options.ConnectionString = "localhost:6379";
+    options.PayloadMode = RedisStreamPayloadMode.Json;
+});
+```
+
+Events are then written as human-readable JSON. An external Python consumer:
+
+```python
+import redis
+
+r = redis.Redis()
+# Create consumer group (once)
+try:
+    r.xgroup_create("orleans:stream:0", "my-service", "0", mkstream=True)
+except redis.ResponseError as e:
+    if "BUSYGROUP" not in str(e):
+        raise
+
+while True:
+    entries = r.xreadgroup("my-service", "worker-1",
+                           {"orleans:stream:0": ">"}, count=10, block=5000)
+    for stream, messages in entries:
+        for msg_id, fields in messages:
+            if fields.get(b"_payload_mode") == b"json":
+                import json
+                events = json.loads(fields[b"payload"])
+                print(f"Received: {events}")
+            r.xack("orleans:stream:0", "my-service", msg_id)
+```
+
+See [Configuration Reference](configuration.md#json-payload-mode) for details.
 
 ## Next steps
 

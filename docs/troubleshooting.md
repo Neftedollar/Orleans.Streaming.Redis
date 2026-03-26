@@ -92,6 +92,30 @@ redis-cli XRANGE dlq:stream:0 - + COUNT 5
 - Increase `MaxBatchSize` for larger poll batches
 - Profile subscriber grain for slow operations
 
+### External consumer sees binary data instead of JSON
+
+**Symptom:** A non-Orleans consumer reads from the Redis Stream but sees opaque binary blobs in the `data` field.
+
+**Fix:** Enable JSON payload mode on the producer:
+```csharp
+options.PayloadMode = RedisStreamPayloadMode.Json;
+```
+
+After enabling, new entries will have human-readable fields (`stream_namespace`, `stream_key`, `payload`). Existing binary entries remain in the stream until they are trimmed by `MaxStreamLength`.
+
+### JSON deserialization failures after schema change
+
+**Symptom:** `messages_failed` counter increases after deploying a new event type schema.
+
+**Causes:**
+1. **Property renamed/removed** — JSON mode does not embed type information. If a property was renamed, old JSON entries may fail to deserialize into the new type.
+2. **Type changed** — e.g., `int` → `string`. JSON deserialization is strict by default.
+
+**Solutions:**
+- Use `[JsonPropertyName("oldName")]` to maintain backward compatibility
+- Configure `JsonSerializerOptions` with lenient settings if needed
+- Enable `DeadLetterPrefix` to capture failed entries for inspection
+
 ### `XCLAIM` messages in logs
 
 **Symptom:** Log shows `RedisStreamReceiver: claimed N orphaned pending messages`.

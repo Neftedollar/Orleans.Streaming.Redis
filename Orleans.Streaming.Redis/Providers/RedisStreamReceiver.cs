@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using Orleans.Providers.Streams.Common;
 using Orleans.Serialization;
@@ -31,6 +32,7 @@ public class RedisStreamReceiver : IQueueAdapterReceiver
     private readonly Serializer _serializer;
     private readonly ILogger? _logger;
     private readonly string? _deadLetterStreamKey;
+    private readonly JsonSerializerOptions _jsonOptions;
     private string _consumerId = string.Empty;
 
     /// <summary>
@@ -54,6 +56,10 @@ public class RedisStreamReceiver : IQueueAdapterReceiver
     /// Optional Redis Stream key for dead-letter entries. When non-null, messages
     /// that fail deserialization are forwarded here and XACK'd from the main stream.
     /// </param>
+    /// <param name="jsonSerializerOptions">
+    /// JSON serializer options used to deserialize JSON-mode entries. The read path
+    /// auto-detects the payload format, so these options are always needed.
+    /// </param>
     public RedisStreamReceiver(
         string streamKey,
         string consumerGroup,
@@ -61,7 +67,8 @@ public class RedisStreamReceiver : IQueueAdapterReceiver
         IDatabase db,
         Serializer serializer,
         ILogger? logger = null,
-        string? deadLetterStreamKey = null)
+        string? deadLetterStreamKey = null,
+        JsonSerializerOptions? jsonSerializerOptions = null)
     {
         _streamKey = streamKey;
         _consumerGroup = consumerGroup;
@@ -70,6 +77,7 @@ public class RedisStreamReceiver : IQueueAdapterReceiver
         _serializer = serializer;
         _logger = logger;
         _deadLetterStreamKey = deadLetterStreamKey;
+        _jsonOptions = jsonSerializerOptions ?? JsonPayloadSerializer.DefaultOptions;
     }
 
     /// <inheritdoc />
@@ -238,33 +246,46 @@ public class RedisStreamReceiver : IQueueAdapterReceiver
 
         foreach (var entry in allEntries)
         {
-            var dataEntry = entry["data"];
-            if (dataEntry.IsNull)
-                continue;
-
             try
             {
-                var payload = _serializer.Deserialize<RedisStreamPayload>((byte[])dataEntry!);
-                if (payload is null)
-                    continue;
-
-                // Deserialize each event from its individual byte[] envelope.
-                var events = payload.EventPayloads
-                    .Select(bytes => _serializer.Deserialize<object>(bytes))
-                    .ToList();
-
-                var streamId = StreamId.Create(payload.StreamNamespace ?? string.Empty, payload.StreamKey);
-
+                RedisBatchContainer container;
                 var token = ParseRedisEntryId(entry.Id.ToString());
 
-                var container = new RedisBatchContainer(
-                    streamId,
-                    events!,
-                    payload.RequestContext,
-                    token)
+                if (JsonPayloadSerializer.IsJsonEntry(entry))
                 {
-                    RedisEntryId = entry.Id.ToString()
-                };
+                    // JSON payload mode — auto-detected via discriminator field.
+                    var (streamId, jsonEvents, requestContext) =
+                        JsonPayloadSerializer.Deserialize(entry, _jsonOptions);
+
+                    container = new RedisBatchContainer(
+                        streamId, jsonEvents, _jsonOptions, requestContext, token)
+                    {
+                        RedisEntryId = entry.Id.ToString()
+                    };
+                }
+                else
+                {
+                    // Binary payload mode (default).
+                    var dataEntry = entry["data"];
+                    if (dataEntry.IsNull)
+                        continue;
+
+                    var payload = _serializer.Deserialize<RedisStreamPayload>((byte[])dataEntry!);
+                    if (payload is null)
+                        continue;
+
+                    var events = payload.EventPayloads
+                        .Select(bytes => _serializer.Deserialize<object>(bytes))
+                        .ToList();
+
+                    var streamId = StreamId.Create(payload.StreamNamespace ?? string.Empty, payload.StreamKey);
+
+                    container = new RedisBatchContainer(
+                        streamId, events!, payload.RequestContext, token)
+                    {
+                        RedisEntryId = entry.Id.ToString()
+                    };
+                }
 
                 result.Add(container);
                 RedisStreamMetrics.MessagesDequeued.Add(1);

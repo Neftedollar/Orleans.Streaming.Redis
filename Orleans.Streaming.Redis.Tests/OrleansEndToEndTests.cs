@@ -425,6 +425,136 @@ public class OrleansEndToEndTests
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// E2E tests for JSON payload mode.
+// Uses a separate TestCluster with PayloadMode = Json.
+// ────────────────────────────────────────────────────────────────────────────
+
+/// <summary>
+/// Silo configurator that wires up AddRedisStreams with JSON payload mode.
+/// </summary>
+public class RedisStreamJsonSiloConfigurator : ISiloConfigurator
+{
+    public static string RedisConnectionString { get; set; } = string.Empty;
+
+    public void Configure(ISiloBuilder siloBuilder)
+    {
+        siloBuilder.AddMemoryGrainStorage("PubSubStore");
+
+        siloBuilder.AddRedisStreams(
+            "RedisStreamsJson",
+            opts =>
+            {
+                opts.ConnectionString = RedisConnectionString;
+                opts.QueueCount = 1;
+                opts.KeyPrefix = "test:e2e:json";
+                opts.MaxStreamLength = 1000;
+                opts.PayloadMode = RedisStreamPayloadMode.Json;
+            },
+            configurator =>
+            {
+                configurator.UseConsistentRingQueueBalancer();
+                configurator.ConfigurePullingAgent(o =>
+                    o.Configure(opts => opts.GetQueueMsgsTimerPeriod = TimeSpan.FromMilliseconds(100)));
+            });
+    }
+}
+
+[TestFixture]
+[Category("E2E")]
+public class OrleansEndToEndJsonTests
+{
+    private RedisContainer _redis = null!;
+    private InProcessTestCluster _cluster = null!;
+    private IConnectionMultiplexer? _redisConn;
+
+    [OneTimeSetUp]
+    public async Task OneTimeSetUp()
+    {
+        _redis = new RedisBuilder().Build();
+        await _redis.StartAsync();
+
+        RedisStreamJsonSiloConfigurator.RedisConnectionString = _redis.GetConnectionString();
+
+        var builder = new InProcessTestClusterBuilder(1);
+        builder.ConfigureSilo((_, siloBuilder) =>
+        {
+            new RedisStreamJsonSiloConfigurator().Configure(siloBuilder);
+        });
+
+        builder.ConfigureClient(clientBuilder =>
+        {
+            clientBuilder.AddRedisStreams(
+                "RedisStreamsJson",
+                opts =>
+                {
+                    opts.ConnectionString = RedisStreamJsonSiloConfigurator.RedisConnectionString;
+                    opts.QueueCount = 1;
+                    opts.KeyPrefix = "test:e2e:json";
+                    opts.MaxStreamLength = 1000;
+                    opts.PayloadMode = RedisStreamPayloadMode.Json;
+                });
+        });
+
+        _cluster = builder.Build();
+        await _cluster.DeployAsync();
+        await Task.Delay(TimeSpan.FromSeconds(5));
+
+        _redisConn = await ConnectionMultiplexer.ConnectAsync(
+            RedisStreamJsonSiloConfigurator.RedisConnectionString);
+    }
+
+    [OneTimeTearDown]
+    public async Task OneTimeTearDown()
+    {
+        _redisConn?.Dispose();
+        if (_cluster is not null)
+        {
+            await _cluster.StopAllSilosAsync();
+            await _cluster.DisposeAsync();
+        }
+        await _redis.DisposeAsync();
+    }
+
+    [Test]
+    public async Task E2E_JsonMode_ProduceAndConsume()
+    {
+        const string streamNs = "e2e-json-ns";
+        const string streamKey = "e2e-json-key";
+        const string providerName = "RedisStreamsJson";
+
+        var subscriber = _cluster.Client.GetGrain<ITestSubscriberGrain>("json-subscriber");
+        await subscriber.SubscribeAsync(streamNs, streamKey, providerName);
+        await Task.Delay(TimeSpan.FromSeconds(1));
+
+        var producer = _cluster.Client.GetGrain<ITestProducerGrain>("json-producer");
+        await producer.ProduceAsync(streamNs, streamKey, providerName, "json-hello");
+
+        List<string> received = [];
+        for (var i = 0; i < 100; i++)
+        {
+            await Task.Delay(100);
+            received = await subscriber.GetReceivedAsync();
+            if (received.Contains("json-hello")) break;
+        }
+
+        Assert.That(received, Contains.Item("json-hello"),
+            "Grain should receive the message via JSON payload mode");
+
+        // Verify the raw Redis entry is human-readable JSON.
+        var db = _redisConn!.GetDatabase();
+        var server = _redisConn.GetServer(_redisConn.GetEndPoints()[0]);
+        var keys = server.Keys(pattern: "test:e2e:json:*").ToList();
+        Assert.That(keys, Is.Not.Empty);
+
+        var entries = await db.StreamRangeAsync(keys[0], "-", "+");
+        // Find the entry with our message
+        var jsonEntry = entries.FirstOrDefault(e => !e["_payload_mode"].IsNull);
+        Assert.That(jsonEntry.Id.ToString(), Is.Not.Null.And.Not.Empty,
+            "At least one JSON-mode entry should exist in the stream");
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Shutdown + Recovery test (Fix 6): DELCONSUMER → restart → XCLAIM.
 // This test operates at the RedisStreamReceiver level (no TestCluster needed)
 // and verifies that after a consumer shutdown + re-initialization, orphaned

@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Microsoft.Extensions.DependencyInjection;
 using Orleans.Providers.Streams.Common;
 using Orleans.Serialization;
@@ -553,5 +554,214 @@ public class RedisIntegrationTests
         var dlLength = await db.StreamLengthAsync(dlStreamKey);
         Assert.That(dlLength, Is.EqualTo(1),
             "Dead-letter stream should contain exactly 1 entry for the corrupt message");
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // JSON payload mode tests
+    // ────────────────────────────────────────────────────────────────────────
+
+    [Test]
+    public async Task Adapter_JsonMode_QueueAndReceive_RoundTrip()
+    {
+        var options = new RedisStreamOptions
+        {
+            ConnectionString = _redis.GetConnectionString(),
+            QueueCount = 1,
+            KeyPrefix = "test:json:roundtrip",
+            MaxStreamLength = 1000,
+            PayloadMode = RedisStreamPayloadMode.Json,
+        };
+        var mapper = new RedisStreamQueueMapper(1, "json-rt");
+        var adapter = new RedisStreamAdapter("json-rt", options, _connection, _serializer, mapper);
+
+        var streamId = StreamId.Create("ns", "key1");
+        await adapter.QueueMessageBatchAsync(streamId, new[] { "hello", "world" }, null, null);
+
+        var queueId = mapper.GetAllQueues().First();
+        var receiver = adapter.CreateReceiver(queueId);
+        await receiver.Initialize(TimeSpan.FromSeconds(5));
+
+        var messages = await receiver.GetQueueMessagesAsync(10);
+
+        Assert.That(messages, Has.Count.EqualTo(1));
+        var container = (RedisBatchContainer)messages[0];
+        Assert.That(container.StreamId, Is.EqualTo(streamId));
+
+        var events = container.GetEvents<string>().ToList();
+        Assert.That(events, Has.Count.EqualTo(2));
+        Assert.That(events[0].Item1, Is.EqualTo("hello"));
+        Assert.That(events[1].Item1, Is.EqualTo("world"));
+    }
+
+    [Test]
+    public async Task Adapter_JsonMode_CustomType_RoundTrip()
+    {
+        var options = new RedisStreamOptions
+        {
+            ConnectionString = _redis.GetConnectionString(),
+            QueueCount = 1,
+            KeyPrefix = "test:json:customtype",
+            MaxStreamLength = 1000,
+            PayloadMode = RedisStreamPayloadMode.Json,
+        };
+        var mapper = new RedisStreamQueueMapper(1, "json-ct");
+        var adapter = new RedisStreamAdapter("json-ct", options, _connection, _serializer, mapper);
+
+        var streamId = StreamId.Create("orders", "stream1");
+        var sent = new OrderPlacedEvent("ORD-42", 99.95m, new DateTimeOffset(2026, 3, 22, 12, 0, 0, TimeSpan.Zero));
+
+        await adapter.QueueMessageBatchAsync(streamId, new[] { sent }, null, null);
+
+        var queueId = mapper.GetAllQueues().First();
+        var receiver = adapter.CreateReceiver(queueId);
+        await receiver.Initialize(TimeSpan.FromSeconds(5));
+
+        var messages = await receiver.GetQueueMessagesAsync(10);
+
+        Assert.That(messages, Has.Count.EqualTo(1));
+        var events = ((RedisBatchContainer)messages[0]).GetEvents<OrderPlacedEvent>().ToList();
+        Assert.That(events, Has.Count.EqualTo(1));
+
+        var received = events[0].Item1;
+        Assert.That(received.OrderId, Is.EqualTo(sent.OrderId));
+        Assert.That(received.Amount, Is.EqualTo(sent.Amount));
+        Assert.That(received.PlacedAt, Is.EqualTo(sent.PlacedAt));
+    }
+
+    [Test]
+    public async Task Adapter_JsonMode_RedisEntryIsHumanReadable()
+    {
+        var options = new RedisStreamOptions
+        {
+            ConnectionString = _redis.GetConnectionString(),
+            QueueCount = 1,
+            KeyPrefix = "test:json:readable",
+            MaxStreamLength = 1000,
+            PayloadMode = RedisStreamPayloadMode.Json,
+        };
+        var mapper = new RedisStreamQueueMapper(1, "json-read");
+        var adapter = new RedisStreamAdapter("json-read", options, _connection, _serializer, mapper);
+
+        var streamId = StreamId.Create("orders", "ORD-1");
+        var evt = new OrderPlacedEvent("ORD-1", 42.00m, DateTimeOffset.UtcNow);
+        await adapter.QueueMessageBatchAsync(streamId, new[] { evt }, null, null);
+
+        // Read raw entry via XRANGE to verify human-readable fields.
+        var db = _connection.GetDatabase();
+        var queueId = mapper.GetAllQueues().First();
+        var streamKey = RedisStreamQueueMapper.GetRedisKey(options.KeyPrefix, queueId);
+        var entries = await db.StreamRangeAsync(streamKey, "-", "+");
+
+        Assert.That(entries, Has.Length.EqualTo(1));
+        var entry = entries[0];
+
+        // Verify discriminator
+        Assert.That((string?)entry["_payload_mode"], Is.EqualTo("json"));
+        // Verify stream metadata
+        Assert.That((string?)entry["stream_namespace"], Is.EqualTo("orders"));
+        Assert.That((string?)entry["stream_key"], Is.EqualTo("ORD-1"));
+        // Verify payload is valid JSON containing the order
+        var payloadJson = (string?)entry["payload"];
+        Assert.That(payloadJson, Does.Contain("ORD-1"));
+
+        // Parse and verify it's a JSON array
+        var doc = JsonDocument.Parse(payloadJson!);
+        Assert.That(doc.RootElement.ValueKind, Is.EqualTo(JsonValueKind.Array));
+        Assert.That(doc.RootElement.GetArrayLength(), Is.EqualTo(1));
+    }
+
+    [Test]
+    public async Task Receiver_AutoDetects_MixedBinaryAndJson()
+    {
+        const string prefix = "test:mixed";
+        const string group = "mixed-group";
+
+        var binaryOptions = new RedisStreamOptions
+        {
+            ConnectionString = _redis.GetConnectionString(),
+            QueueCount = 1,
+            KeyPrefix = prefix,
+            ConsumerGroup = group,
+            MaxStreamLength = 1000,
+            PayloadMode = RedisStreamPayloadMode.Binary,
+        };
+        var jsonOptions = new RedisStreamOptions
+        {
+            ConnectionString = _redis.GetConnectionString(),
+            QueueCount = 1,
+            KeyPrefix = prefix,
+            ConsumerGroup = group,
+            MaxStreamLength = 1000,
+            PayloadMode = RedisStreamPayloadMode.Json,
+        };
+
+        var mapper = new RedisStreamQueueMapper(1, "mixed-test");
+        var binaryAdapter = new RedisStreamAdapter("mixed-test", binaryOptions, _connection, _serializer, mapper);
+        var jsonAdapter = new RedisStreamAdapter("mixed-test", jsonOptions, _connection, _serializer, mapper);
+
+        var streamId = StreamId.Create("ns", "mixed-key");
+
+        // Write one Binary entry, then one JSON entry.
+        await binaryAdapter.QueueMessageBatchAsync(streamId, new[] { "binary-msg" }, null, null);
+        await jsonAdapter.QueueMessageBatchAsync(streamId, new[] { "json-msg" }, null, null);
+
+        // A receiver with JSON options should auto-detect both formats.
+        var queueId = mapper.GetAllQueues().First();
+        var receiver = jsonAdapter.CreateReceiver(queueId);
+        await receiver.Initialize(TimeSpan.FromSeconds(5));
+
+        var messages = await receiver.GetQueueMessagesAsync(10);
+        Assert.That(messages, Has.Count.EqualTo(2));
+
+        var allEvents = messages
+            .Cast<RedisBatchContainer>()
+            .SelectMany(c => c.GetEvents<string>().Select(t => t.Item1))
+            .ToList();
+
+        Assert.That(allEvents, Does.Contain("binary-msg"));
+        Assert.That(allEvents, Does.Contain("json-msg"));
+    }
+
+    [Test]
+    public async Task Adapter_JsonMode_CustomJsonSerializerOptions()
+    {
+        var customOptions = new JsonSerializerOptions
+        {
+            PropertyNamingPolicy = null, // PascalCase
+            WriteIndented = false,
+        };
+
+        var options = new RedisStreamOptions
+        {
+            ConnectionString = _redis.GetConnectionString(),
+            QueueCount = 1,
+            KeyPrefix = "test:json:custom-opts",
+            MaxStreamLength = 1000,
+            PayloadMode = RedisStreamPayloadMode.Json,
+            JsonSerializerOptions = customOptions,
+        };
+        var mapper = new RedisStreamQueueMapper(1, "json-co");
+        var adapter = new RedisStreamAdapter("json-co", options, _connection, _serializer, mapper);
+
+        var streamId = StreamId.Create("orders", "co-key");
+        var sent = new OrderPlacedEvent("ORD-99", 10.00m, new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero));
+
+        await adapter.QueueMessageBatchAsync(streamId, new[] { sent }, null, null);
+
+        // Verify PascalCase in raw entry
+        var db = _connection.GetDatabase();
+        var queueId = mapper.GetAllQueues().First();
+        var streamKey = RedisStreamQueueMapper.GetRedisKey(options.KeyPrefix, queueId);
+        var entries = await db.StreamRangeAsync(streamKey, "-", "+");
+        var payloadJson = (string?)entries[0]["payload"];
+        Assert.That(payloadJson, Does.Contain("OrderId"), "PascalCase option should produce PascalCase keys");
+        Assert.That(payloadJson, Does.Not.Contain("orderId"), "Should not contain camelCase keys");
+
+        // Verify roundtrip works with same options
+        var receiver = adapter.CreateReceiver(queueId);
+        await receiver.Initialize(TimeSpan.FromSeconds(5));
+        var messages = await receiver.GetQueueMessagesAsync(10);
+        var events = ((RedisBatchContainer)messages[0]).GetEvents<OrderPlacedEvent>().ToList();
+        Assert.That(events[0].Item1.OrderId, Is.EqualTo("ORD-99"));
     }
 }

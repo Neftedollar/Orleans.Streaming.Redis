@@ -26,6 +26,8 @@ silo.AddRedisStreams("MyProvider", options =>
 | `MaxStreamLength` | `int` | `10000` | `MAXLEN` argument for `XADD`. Caps the number of entries in each Redis Stream. Uses approximate trimming (`~`) for performance. Set to `0` for unlimited (not recommended in production). |
 | `Database` | `int` | `-1` | Redis database index. `-1` uses the default database from the connection string. |
 | `CacheSize` | `int` | `4096` | In-memory cache capacity (number of batch containers) per queue partition. When the cache fills up, backpressure signals the pulling agent to slow down. Must be > 0. |
+| `PayloadMode` | `RedisStreamPayloadMode` | `Binary` | Controls event serialization format. `Binary` uses Orleans binary serializer (compact, opaque). `Json` uses `System.Text.Json` for human-readable entries that non-Orleans consumers can read. The read path auto-detects the format, so mixed entries work during rolling deployments. |
+| `JsonSerializerOptions` | `JsonSerializerOptions?` | `null` | Custom `System.Text.Json.JsonSerializerOptions` for JSON payload mode. When `null`, defaults to camelCase naming, no indentation, and ignore-null-when-writing. Only used when `PayloadMode = Json`. |
 | `DeadLetterPrefix` | `string?` | `null` | Redis key prefix for the dead-letter stream. When set, messages that fail deserialization are forwarded to `{DeadLetterPrefix}:{partitionIndex}` and XACK'd from the main stream. When `null`, failed messages are XACK'd and discarded (with error logging). |
 
 ### Validation
@@ -122,3 +124,80 @@ silo.AddRedisStreams("BulkProcessing", options =>
 ```
 
 Each provider manages its own Redis connection, consumer groups, and stream keys independently.
+
+## JSON Payload Mode
+
+Enable JSON mode to write human-readable entries for interop with non-Orleans consumers:
+
+```csharp
+silo.AddRedisStreams("InteropProvider", options =>
+{
+    options.ConnectionString = "localhost:6379";
+    options.PayloadMode = RedisStreamPayloadMode.Json;
+});
+```
+
+### Redis entry structure (JSON mode)
+
+| Field | Content |
+|-------|---------|
+| `_payload_mode` | `"json"` — discriminator for auto-detection |
+| `stream_namespace` | Orleans stream namespace |
+| `stream_key` | Orleans stream key |
+| `payload` | JSON array of serialized events |
+| `request_context` | JSON object (only present if non-null) |
+
+### Custom serialization options
+
+```csharp
+options.PayloadMode = RedisStreamPayloadMode.Json;
+options.JsonSerializerOptions = new JsonSerializerOptions
+{
+    PropertyNamingPolicy = null,  // PascalCase instead of camelCase
+    WriteIndented = true,         // pretty-print (not recommended for production)
+};
+```
+
+### Auto-detection on read
+
+The receiver automatically detects whether each entry is Binary or JSON by checking for the `_payload_mode` field. This means:
+
+- **Rolling deployments** work seamlessly — old silos write Binary, new silos write JSON, and all silos can read both formats.
+- The `PayloadMode` option only controls the **write** path.
+
+### Non-Orleans consumer example (Node.js)
+
+```javascript
+const Redis = require('ioredis');
+const redis = new Redis();
+
+// Create consumer group (once)
+await redis.xgroup('CREATE', 'orleans:stream:0', 'my-service', '0', 'MKSTREAM')
+  .catch(err => { if (!err.message.includes('BUSYGROUP')) throw err; });
+
+// Read messages
+while (true) {
+  const entries = await redis.xreadgroup(
+    'GROUP', 'my-service', 'worker-1',
+    'COUNT', 10, 'BLOCK', 5000,
+    'STREAMS', 'orleans:stream:0', '>'
+  );
+
+  if (!entries) continue;
+
+  for (const [, messages] of entries) {
+    for (const [id, fields] of messages) {
+      const obj = {};
+      for (let i = 0; i < fields.length; i += 2)
+        obj[fields[i]] = fields[i + 1];
+
+      if (obj._payload_mode === 'json') {
+        const events = JSON.parse(obj.payload);
+        console.log(`Stream: ${obj.stream_namespace}/${obj.stream_key}`, events);
+      }
+
+      await redis.xack('orleans:stream:0', 'my-service', id);
+    }
+  }
+}
+```

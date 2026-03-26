@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Orleans.Providers.Streams.Common;
 using Orleans.Runtime;
 using Orleans.Streams;
@@ -8,6 +9,7 @@ namespace Orleans.Streaming.Redis.Providers;
 /// Wraps events from a single Redis Stream entry into an Orleans IBatchContainer.
 /// Each entry maps to one batch container with a sequence token derived from the Redis entry ID.
 /// Carries the Redis entry ID for XACK on delivery confirmation.
+/// Supports both Binary (Orleans serializer) and JSON (System.Text.Json) payload modes.
 /// </summary>
 [GenerateSerializer]
 public class RedisBatchContainer : IBatchContainer
@@ -17,6 +19,12 @@ public class RedisBatchContainer : IBatchContainer
     [Id(2)] private readonly Dictionary<string, object>? _requestContext;
     [Id(3)] private readonly EventSequenceTokenV2 _sequenceToken;
 
+    // JSON-mode fields — not Orleans-serialized (transient, silo-local only).
+    [NonSerialized]
+    private readonly List<JsonElement>? _jsonEvents;
+    [NonSerialized]
+    private readonly JsonSerializerOptions? _jsonOptions;
+
     /// <summary>
     /// Redis Stream entry ID (e.g., "1679000000000-0"). Used by
     /// <see cref="RedisStreamReceiver.MessagesDeliveredAsync"/> to XACK.
@@ -25,7 +33,7 @@ public class RedisBatchContainer : IBatchContainer
     [Id(4)] public string? RedisEntryId { get; init; }
 
     /// <summary>
-    /// Initialises a new <see cref="RedisBatchContainer"/>.
+    /// Initialises a new <see cref="RedisBatchContainer"/> for Binary payload mode.
     /// </summary>
     /// <param name="streamId">The stream identity these events belong to.</param>
     /// <param name="events">Deserialised event objects from the Redis entry.</param>
@@ -43,6 +51,26 @@ public class RedisBatchContainer : IBatchContainer
         _sequenceToken = sequenceToken;
     }
 
+    /// <summary>
+    /// Initialises a new <see cref="RedisBatchContainer"/> for JSON payload mode.
+    /// Events are stored as <see cref="JsonElement"/> and deserialized lazily in
+    /// <see cref="GetEvents{T}"/>.
+    /// </summary>
+    internal RedisBatchContainer(
+        StreamId streamId,
+        List<JsonElement> jsonEvents,
+        JsonSerializerOptions jsonOptions,
+        Dictionary<string, object>? requestContext,
+        EventSequenceTokenV2 sequenceToken)
+    {
+        _streamId = streamId;
+        _events = []; // not used in JSON mode
+        _jsonEvents = jsonEvents;
+        _jsonOptions = jsonOptions;
+        _requestContext = requestContext;
+        _sequenceToken = sequenceToken;
+    }
+
     /// <inheritdoc />
     public StreamId StreamId => _streamId;
 
@@ -52,9 +80,24 @@ public class RedisBatchContainer : IBatchContainer
     /// <inheritdoc />
     public IEnumerable<Tuple<T, StreamSequenceToken>> GetEvents<T>()
     {
+        if (_jsonEvents is not null)
+            return GetJsonEvents<T>();
+
         return _events
             .OfType<T>()
             .Select((e, i) => Tuple.Create(e, (StreamSequenceToken)_sequenceToken.CreateSequenceTokenForEvent(i)));
+    }
+
+    private IEnumerable<Tuple<T, StreamSequenceToken>> GetJsonEvents<T>()
+    {
+        var index = 0;
+        foreach (var element in _jsonEvents!)
+        {
+            var deserialized = element.Deserialize<T>(_jsonOptions);
+            if (deserialized is not null)
+                yield return Tuple.Create(deserialized, (StreamSequenceToken)_sequenceToken.CreateSequenceTokenForEvent(index));
+            index++;
+        }
     }
 
     /// <inheritdoc />
